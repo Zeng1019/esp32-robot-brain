@@ -363,17 +363,69 @@ def _init_opencv():
     return _yunet is not None or _cascade is not None
 
 
+def _seat_roi_rect(shape_wh=None):
+    """读取 vision.seat_roi（归一化 [x, y, w, h]）。返回 (rx, ry, rw, rh) 或 None。
+
+    2026-10-09 新增：摄像头广角视野里会出现邻座/他人，导致"人不在座却判在座"。
+    seat_roi 把人脸判定和帧差都限定在用户自己的座位区域内，区域外的人脸忽略。
+    """
+    roi = cfg("vision", "seat_roi", default=None)
+    if not roi:
+        return None
+    try:
+        rx, ry, rw, rh = (float(v) for v in roi)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= rx < 1 and 0 <= ry < 1 and 0 < rw <= 1 and 0 < rh <= 1
+            and rx + rw <= 1 and ry + rh <= 1):
+        return None
+    return rx, ry, rw, rh
+
+
+def _count_faces_in_roi(dets, roi, frame_w, frame_h):
+    """统计落在 seat_roi 内的人脸。以人脸框中心点是否在区域内为准。
+
+    返回 (inside, outside, large_inside)。roi 为 None 时全部计入 inside。
+    large_inside 是框宽 >= visitor.min_face_px 的人脸数（访客判定用——
+    远处邻座只有小脸，贴近工位的真访客才会形成大脸）。
+    """
+    min_px = float(cfg("visitor", "min_face_px", default=80))
+    if roi is None:
+        inside = int(len(dets))
+        large = sum(1 for d in dets
+                    if len(d) >= 4 and float(d[2]) >= min_px)
+        return inside, 0, large
+    rx, ry, rw, rh = roi
+    inside = 0
+    outside = 0
+    large = 0
+    for d in dets:
+        try:
+            x, y, fw, fh = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cx = (x + fw / 2) / max(frame_w, 1)
+        cy = (y + fh / 2) / max(frame_h, 1)
+        if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+            inside += 1
+            if fw >= min_px:
+                large += 1
+        else:
+            outside += 1
+    return inside, outside, large
+
+
 def detect_presence_opencv(image_bytes):
     """
     返回 (presence, detail)
       presence: in_seat / absent / unknown
 
-    判据优先级：
+    判据优先级（配置 vision.seat_roi 后，人脸与帧差均只看座位区域）：
       1. 画面过暗                     -> unknown（关灯/遮挡，不能判断）
-      2. YuNet 检测到人脸              -> in_seat（最可靠）
+      2. 座位区域内检测到人脸          -> in_seat（最可靠）
       3. 亮度突变 / 首帧 / 算不出帧差   -> unknown（不改变计时）
-      4. 无人脸 + 画面有变化 + 近期在座  -> in_seat（转身/低头/侧脸）
-      5. 无人脸 + 画面几乎不动，连续 N 次 -> absent（人不在工位）
+      4. 区域内有变化 + 近期在座        -> in_seat（转身/低头/侧脸）
+      5. 区域内几乎不动，连续 N 次      -> absent（人不在工位）
       6. 其余                          -> unknown
     """
     global _prev_gray, _prev_luma, _no_motion_streak, _last_in_seat_ts
@@ -394,9 +446,19 @@ def detect_presence_opencv(image_bytes):
     dark_threshold = float(cfg("vision", "dark_threshold", default=25))
 
     # --- 帧差（画面变化量）---
+    # seat_roi 生效时帧差只算座位区域，邻座/背景里的活动不再污染判定
+    roi = _seat_roi_rect()
     motion = None
     try:
         small = cv2.resize(gray, (80, 60)).astype(np.int16)
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            sx0, sy0 = int(rx * 80), int(ry * 60)
+            sx1, sy1 = int(round((rx + rw) * 80)), int(round((ry + rh) * 60))
+            if sx1 - sx0 >= 8 and sy1 - sy0 >= 8:
+                small = small[sy0:sy1, sx0:sx1]
+            else:
+                roi = None  # 区域过小，退回全帧
         if _prev_gray is not None and _prev_gray.shape == small.shape:
             motion = float(np.abs(small - _prev_gray).mean())
         _prev_gray = small
@@ -414,22 +476,29 @@ def detect_presence_opencv(image_bytes):
                            "motion": motion}
 
     faces = 0
+    faces_out_roi = 0
+    faces_large = 0
     method = "none"
     if _yunet is not None:
         h, w = img.shape[:2]
         _yunet.setInputSize((w, h))
         result = _yunet.detect(img)
         dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
-        if dets is not None:
-            faces = int(len(dets))
+        if dets is not None and len(dets):
+            faces, faces_out_roi, faces_large = _count_faces_in_roi(
+                dets, roi, w, h)
         method = "yunet"
     elif _cascade is not None:
         rects = _cascade.detectMultiScale(gray, scaleFactor=1.1,
                                           minNeighbors=5, minSize=(40, 40))
-        faces = int(len(rects))
+        if rects is not None and len(rects):
+            faces, faces_out_roi, faces_large = _count_faces_in_roi(
+                rects, roi, img.shape[1], img.shape[0])
         method = "haar"
 
     detail = {"method": method, "faces": faces, "motion": motion,
+              "faces_large": faces_large,
+              "faces_out_roi": faces_out_roi if roi is not None else None,
               "luma_delta": None if luma_delta is None else round(luma_delta, 1),
               "no_motion_streak": _no_motion_streak,
               "mean_luma": round(mean_luma, 1)}
@@ -449,15 +518,31 @@ def detect_presence_opencv(image_bytes):
         return "unknown", {**detail, "reason": "frame_not_comparable"}
 
     motion_in_seat = float(cfg("vision", "motion_in_seat_threshold", default=2.5))
+    # 无人脸时的动作兜底门槛要比有常人时的噪音高：办公室里灯光/远处同事/
+    # 窗帘等会在 ROI 内制造 2.5~4.3 的持续低幅噪音，曾把 27 分钟的离座
+    # 全程刷成"在座"（2026-10-09 实测）。有人脸确认走①，这里只兜"转身/
+    # 低头但身体仍在活动"的情况。
+    no_face_motion = float(cfg("vision", "no_face_motion_threshold",
+                               default=4.5))
+    # 动作量过大的"无人脸"帧更像人在走动/出入画面/光线剧变，而不是坐在
+    # 工位上工作（起身离开瞬间实测 50~70），同样不认。
+    no_face_motion_cap = float(cfg("vision", "no_face_motion_cap",
+                                   default=12.0))
 
     # ② 画面有变化 —— 人可能在动
     if motion >= motion_in_seat:
         _no_motion_streak = 0
         # 最近一段时间内确认过在座，才认为是同一个人转身/低头（而不是有人路过）
         window_min = float(cfg("vision", "in_seat_context_minutes", default=30))
-        if _last_in_seat_ts is not None and (now - _last_in_seat_ts) <= window_min * 60:
-            _last_in_seat_ts = now
-            return "in_seat", {**detail, "reason": "no_face_but_motion_continuous"}
+        if (_last_in_seat_ts is not None
+                and (now - _last_in_seat_ts) <= window_min * 60):
+            if no_face_motion <= motion < no_face_motion_cap:
+                # 注意：动作兜底不续命，在座上下文只由"看到人脸"刷新，
+                # 否则离座后的环境噪音能靠这条链路无限自我确认
+                return "in_seat", {**detail,
+                                   "reason": "no_face_but_motion_continuous"}
+            # 动作量太小（环境噪音）或太大（走动/光线变化）：不给在座
+            return "unknown", {**detail, "reason": "motion_out_of_working_band"}
         return "unknown", {**detail, "reason": "motion_without_context"}
 
     # ③ 画面几乎不动 —— 累计确认期后判"无人"，避免 YuNet 偶发漏检导致误判
@@ -1596,6 +1681,8 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     with _state_lock:
         STATE["last_vision_ts"] = now.isoformat(timespec="seconds")
         STATE["last_presence"] = presence
+        STATE["last_vision_faces_large"] = (
+            detail.get("faces_large", 0) if isinstance(detail, dict) else 0)
         STATE["last_photo_meta"] = {
             "device": device_id,
             "bytes": len(image_bytes),
@@ -1624,8 +1711,12 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                             daemon=True).start()
             STATE["last_in_seat_ts"] = now_iso
 
-            # 访客提醒（P2-⑬）：一帧里出现多张脸 → 飞书 + 机器人说一声
-            faces = detail.get("faces", 0) if isinstance(detail, dict) else 0
+            # 访客提醒（P2-⑬）：座位区域内出现第二张"大脸"（贴近工位）→
+            # 飞书 + 机器人说一声。远处邻座的小脸不算（2026-10-09 误报修复）
+            faces = (detail.get("faces_large") if isinstance(detail, dict)
+                     else None)
+            if faces is None:
+                faces = detail.get("faces", 0) if isinstance(detail, dict) else 0
             min_faces = int(cfg("visitor", "min_faces", default=2))
             if cfg("visitor", "enabled", default=True) and faces >= min_faces:
                 v_last = _parse_ts(STATE.get("visitor_last_ts"))
@@ -1739,6 +1830,9 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     # 水位判定）已删除——2026-09-16 双拍摄位分流后不再需要。
     log(f"vision: presence={presence} detail={detail} "
         f"in_seat_min={None if minutes_in_seat is None else round(minutes_in_seat)}")
+
+    # 哨兵"回归"验明正身：暂扣中的回归事件用本张判定照片复核
+    _check_pending_return(presence, detail)
 
 
 def _save_photo(image_bytes, device_id):
@@ -2083,6 +2177,196 @@ def tts_audio(key):
     return resp
 
 
+def _vision_recently_sees_user(max_age_s=390):
+    """最近一次视觉判定是否为"在座且拍到用户大脸"，且证据未过时。
+
+    拍照节奏约 5 分钟一张，390 秒（6.5 分钟）内算新鲜。faces_large>=1 才算
+    真看到人——纯 motion_without_context 的在座不可靠，不能当否决证据。
+    """
+    with _state_lock:
+        ts = STATE.get("last_vision_ts")
+        pres = STATE.get("last_presence")
+        large = STATE.get("last_vision_faces_large", 0)
+    if not ts or pres != "in_seat":
+        return False
+    t = _parse_ts(ts)
+    if t is None or (datetime.now() - t).total_seconds() > max_age_s:
+        return False
+    try:
+        return int(large or 0) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _request_verify_photo():
+    """给设备派一张"立即拍照复核"单（固件 photo 指令，2026-10-10）。
+
+    哨兵离开/回归事件后不再干等下一个 5 分钟周期照：塞一张拍照单进
+    pending 队列，设备 10 秒内领单立即拍照上传，验证延迟缩到 ~20 秒。
+    队列里已有拍照单时不重复派。
+    """
+    with _state_lock:
+        for it in STATE.get("pending", []):
+            if isinstance(it, dict) and it.get("type") == "photo":
+                return
+        STATE["pending"].append({
+            "type": "photo",
+            "message": "verify",
+            "source": "sentinel",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        save_state(STATE)
+    log("已派单：设备立即拍照复核哨兵事件（~10s 内领单）")
+
+
+def _check_pending_return(presence, detail):
+    """哨兵"离开/回归"事件的验明正身（2026-10-10 派单拍照版）。
+
+    哨兵事件到达时桥接先派单让设备立即拍照（_request_verify_photo），
+    本函数在每张判定照片到达后复核暂扣中的事件：
+      - 回归 + 见大脸 → 真回归：按 away_since 补算真实时长播报，计时重起；
+      - 回归 + 无人脸 → 继续暂扣，720s 超时判幻影拦截；
+      - 离座 + 见大脸 → 误报离座：恢复久坐计时（在座秒数未入账）；
+      - 离座 + 无人脸 → 真离座：入账在座秒数。
+    """
+    with _state_lock:
+        pr = STATE.get("pending_return")
+        pa = STATE.get("pending_away")
+        if not pr and not pa:
+            return
+        now = datetime.now()
+        large = detail.get("faces_large", 0) if isinstance(detail, dict) else 0
+        seen = (presence == "in_seat" and int(large or 0) >= 1)
+
+        if pr:
+            if seen:
+                away_since = _parse_ts(STATE.get("away_since") or "")
+                if away_since:
+                    minutes = max(1, int((now - away_since).total_seconds() / 60))
+                    msg = f"主人回到座位啦，刚才离开了大约 {minutes} 分钟。"
+                else:
+                    msg = pr.get("message") or "主人回到座位啦。"
+                STATE["pending_return"] = None
+                STATE["pending_away"] = None
+                STATE["away_since"] = None
+                STATE["in_seat_since"] = now.isoformat(timespec="seconds")
+                STATE["last_remind_ts"] = None
+                push_speak(STATE, msg, source="sentinel")
+                save_state(STATE)
+                log(f"哨兵回归验明正身：照片见到人脸 → 播报回归（{msg}）")
+            else:
+                ts = _parse_ts(pr.get("ts") or "")
+                if ts and (now - ts).total_seconds() > 720:
+                    STATE["pending_return"] = None
+                    save_state(STATE)
+                    log("哨兵回归判幻影：复核期内照片始终未见人脸，拦截播报")
+                else:
+                    log("哨兵回归暂扣中：本张照片未见人脸，继续等待")
+            return
+
+        # 离座复核
+        away_ts = _parse_ts(pa.get("ts") or "") or now
+        if seen:
+            # 误报离座：人还在——在座秒数尚未入账，恢复计时即可
+            STATE["pending_away"] = None
+            STATE["away_since"] = None
+            STATE["in_seat_since"] = away_ts.isoformat(timespec="seconds")
+            save_state(STATE)
+            log("哨兵离座验照：照片见人脸 → 判误报，久坐计时恢复（视为未离座）")
+        else:
+            seg = int(pa.get("seg") or 0)
+            STATE["in_seat_seconds_today"] = (
+                STATE.get("in_seat_seconds_today", 0) + seg)
+            STATE["pending_away"] = None
+            save_state(STATE)
+            log("哨兵离座验照：照片无人脸 → 确认真离座，计时入账")
+
+
+def _sweep_verify_timeouts():
+    """设备离线等导致复核照迟迟不来时的惰性超时结算（/pending 轮询触发）。"""
+    with _state_lock:
+        now = datetime.now()
+        changed = False
+        pr = STATE.get("pending_return")
+        if pr:
+            ts = _parse_ts(pr.get("ts") or "")
+            if ts and (now - ts).total_seconds() > 720:
+                STATE["pending_return"] = None
+                changed = True
+                log("哨兵回归超时未获复核照，判幻影拦截")
+        pa = STATE.get("pending_away")
+        if pa:
+            ts = _parse_ts(pa.get("ts") or "")
+            if ts and (now - ts).total_seconds() > 720:
+                STATE["in_seat_seconds_today"] = (
+                    STATE.get("in_seat_seconds_today", 0)
+                    + int(pa.get("seg") or 0))
+                STATE["pending_away"] = None
+                changed = True
+                log("哨兵离座超时未获复核照，按真离座结算计时")
+        if changed:
+            save_state(STATE)
+
+
+def _reconcile_sentinel_event(message):
+    """固件离座哨兵事件 vs 桥接视觉对账（2026-10-09，10-10 升级派单拍照）。
+
+    固件哨兵只看动作差（15 秒一帧），后仰/低头易把"人还在"误判成"离座"，
+    离座期间判定区里远处同事的动静还会编出"回归"幻影（2026-10-09 实测）。
+    哨兵事件先送这里复核：
+      - 与视觉近期人脸证据矛盾 → 拦截（veto）；
+      - 无近期人脸证据可判 → 暂扣（hold）并派单让设备立即拍照，
+        由 _check_pending_return 用复核照定案（见该函数注释）。
+      - "回到座位"：视觉近期一直见人脸 → 用户根本没走过，拦截播报；
+      - "离开了座位"：视觉近期见人脸 → 疑似误判，拦截提醒；
+      - 视觉证据过时或与事件一致 → 放行，并对账久坐计时
+        （放行离座 → 计时暂停；放行回归 → 计时重新起算）。
+    副作用：短离座（<约 6 分钟）天然被静默成"计数不打扰"，与喝水策略一致。
+    返回 "veto"（拦截）或 "accept"（放行）。
+    """
+    vision_sees_user = _vision_recently_sees_user()
+    if "回到座位" in message:
+        if vision_sees_user:
+            log("哨兵对账：报'回到座位'但视觉近期持续见人脸 → 判误报，已拦截播报")
+            return "veto"
+        # 幻影回归防御（2026-10-09 晚）：用户实测离座期间哨兵仍连报
+        # "回归→离座→回归"（判定区里远处同事的动静骗过了纯动作差检测）。
+        # 眼里没有近期人脸证据时不再直接放行播报，而是暂扣，等下一张
+        # 判定照片验明正身（见 _check_pending_return）。
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with _state_lock:
+            old = STATE.get("pending_return")
+            if old:
+                log("哨兵对账：又一条'回归'，覆盖暂扣中的上一条")
+            STATE["pending_return"] = {"ts": now_iso, "message": message}
+            save_state(STATE)
+        log("哨兵对账：报'回归'但无近期人脸证据 → 暂扣播报，立即拍照复核")
+        _request_verify_photo()
+        return "hold"
+    if "离开了座位" in message:
+        if vision_sees_user:
+            log("哨兵对账：报'离座'但视觉近期见人脸 → 判误报，已拦截提醒")
+            return "veto"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with _state_lock:
+            since = _parse_ts(STATE.get("in_seat_since") or "")
+            # 在座秒数先不入账：等复核照确认是真离座再结算（见
+            # _check_pending_return），误报离座时计时无缝恢复
+            seg = int((datetime.now() - since).total_seconds()) if since else 0
+            STATE["in_seat_since"] = None
+            # 新的离座事件说明暂扣中的"回归"是幻影（人没回来过就谈不上再离开）
+            if STATE.get("pending_return"):
+                STATE["pending_return"] = None
+                log("哨兵对账：离座事件到达，暂扣中的'回归'判幻影丢弃")
+            STATE["away_since"] = now_iso
+            STATE["pending_away"] = {"ts": now_iso, "seg": seg}
+            save_state(STATE)
+        log("哨兵对账：报'离座'且无近期人脸证据 → 暂缓结算，立即拍照复核")
+        _request_verify_photo()
+        return "hold"
+    return "accept"
+
+
 @app.route("/notify", methods=["POST"])
 def notify():
     """反向通道入口（P2-⑨）：外部（Hermes 技能、日历轮询、其他程序）推一句
@@ -2117,6 +2401,17 @@ def notify():
         return jsonify({"ok": True, "message": "重复消息已忽略（90 秒内去重）",
                         "deduped": True})
 
+    # 哨兵事件对账（2026-10-09）：固件离座哨兵的"离开/回来"先送视觉复核，
+    # 与最近人脸判定矛盾时拦截，避免"刚提醒起身又说你回来了"这类打架
+    if source == "sentinel":
+        verdict = _reconcile_sentinel_event(message)
+        if verdict == "veto":
+            return jsonify({"ok": True, "vetoed": True,
+                            "message": "视觉判定与哨兵事件矛盾，已拦截播报"})
+        if verdict == "hold":
+            return jsonify({"ok": True, "held": True,
+                            "message": "哨兵事件暂扣，已派单拍照复核"})
+
     with _state_lock:
         reset_daily_if_needed(STATE)
         if kind == "alert":
@@ -2143,6 +2438,7 @@ def pending():
     if not check_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _DEVICE_LAST_SEEN["ts"] = time.time()   # Dashboard：设备在线心跳
+    _sweep_verify_timeouts()                # 复核事件惰性超时结算
     with _state_lock:
         items = list(STATE.get("pending", []))
     return jsonify({"ok": True, "items": items})
