@@ -276,6 +276,8 @@ def reset_daily_if_needed(st):
 
 _yunet = None
 _cascade = None
+_sface = None              # SFace 人脸识别模型（认"主人"而非"任意脸"）
+_user_templates = None     # 主人特征模板 np.ndarray (N, 128)，注册后常驻
 _cv2_ready = None
 _prev_gray = None
 _prev_luma = None
@@ -291,6 +293,8 @@ YUNET_URLS = [
 ]
 MODEL_DIR = DATA_DIR / "models"
 YUNET_FILE = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
+SFACE_FILE = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
+USER_FACE_FILE = DATA_DIR / "user_face.npz"   # 主人特征模板（可多张）
 
 
 def _download_yunet():
@@ -314,9 +318,36 @@ def _download_yunet():
     return False
 
 
+def _load_user_templates():
+    """加载主人特征模板（data/user_face.npz，键 features = (N,128)）。
+
+    2026-10-10 人脸识别上线：YuNet 只能说"有张脸"，SFace 特征比对才能
+    认出"这是主人"。没有模板时识别关闭，行为退回纯检测模式。
+    """
+    global _user_templates
+    if not USER_FACE_FILE.exists():
+        _user_templates = None
+        return None
+    try:
+        import numpy as np
+        data = np.load(USER_FACE_FILE)
+        feats = np.asarray(data["features"], dtype=np.float32)
+        if feats.ndim == 1:
+            feats = feats.reshape(1, -1)
+        if feats.size == 0:
+            _user_templates = None
+            return None
+        _user_templates = feats
+        return feats.shape[0]
+    except Exception as e:  # noqa: BLE001
+        log(f"主人模板加载失败：{e}", "WARN")
+        _user_templates = None
+        return None
+
+
 def _init_opencv():
     """惰性加载 OpenCV。返回 True 表示人脸检测可用。"""
-    global _cv2_ready, _yunet, _cascade
+    global _cv2_ready, _yunet, _cascade, _sface
     if _cv2_ready is not None:
         return _cv2_ready
     try:
@@ -358,6 +389,27 @@ def _init_opencv():
     if _yunet is None and _cascade is None:
         log("没有人脸检测模型，判定将始终为 unknown（不会误提醒，但久坐提醒也"
             "不会生效）。请确认模型文件已就位。", "ERROR")
+
+    # ---- 人脸识别（SFace）：config vision.recog_enabled 开启 ----
+    if _yunet is not None and cfg("vision", "recog_enabled", default=False):
+        sface_path = (cfg("vision", "recog_model", default="") or "").strip()
+        sface_candidate = Path(sface_path) if sface_path else SFACE_FILE
+        if sface_candidate.exists():
+            try:
+                _sface = cv2.FaceRecognizerSF.create(str(sface_candidate), "")
+                n = _load_user_templates()
+                if n:
+                    log(f"已加载 SFace 人脸识别模型 + 主人模板 {n} 张："
+                        f"{sface_candidate}")
+                else:
+                    log("已加载 SFace 模型，但尚无主人模板（POST /enroll 注册），"
+                        "识别暂不生效", "WARN")
+                    _sface = None
+            except Exception as e:  # noqa: BLE001
+                log(f"SFace 加载失败：{e}", "WARN")
+                _sface = None
+        else:
+            log(f"SFace 模型不存在（{sface_candidate}），人脸识别未启用", "WARN")
 
     _cv2_ready = True
     return _yunet is not None or _cascade is not None
@@ -413,6 +465,108 @@ def _count_faces_in_roi(dets, roi, frame_w, frame_h):
         else:
             outside += 1
     return inside, outside, large
+
+
+def _cosine_sim(a, b):
+    import numpy as np
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+
+def _recognize_owner(img, dets, roi, frame_w, frame_h):
+    """对 ROI 内的每张脸提取 SFace 特征，与主人模板比对。
+
+    返回 dict：
+      user_sims     主人匹配到的最大相似度（无人脸/未启用时 None）
+      user_faces    判定为主人的人脸数（ROI 内）
+      stranger_faces  ROI 内"不是主人"的大脸数（访客判定用）
+      sims          ROI 内每张脸的 (best_sim, face_w) 列表（调试用）
+    框过小（< recog_min_face_px，默认 60px）的特征不可靠，跳过识别
+    （远处小脸不算主人也不算陌生人）。
+    """
+    out = {"user_sims": None, "user_faces": 0, "stranger_faces": 0, "sims": []}
+    if _sface is None or _user_templates is None or dets is None:
+        return out
+    import numpy as np
+
+    min_px = float(cfg("vision", "recog_min_face_px", default=60))
+    thr = float(cfg("vision", "recog_threshold", default=0.363))
+    rx = ry = rw = rh = None
+    if roi is not None:
+        rx, ry, rw, rh = roi
+
+    best_user = None
+    for d in dets:
+        try:
+            x, y, fw, fh = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cx = (x + fw / 2) / max(frame_w, 1)
+        cy = (y + fh / 2) / max(frame_h, 1)
+        if roi is not None and not (rx <= cx <= rx + rw
+                                    and ry <= cy <= ry + rh):
+            continue
+        if fw < min_px:
+            continue
+        try:
+            aligned = _sface.alignCrop(img, d)
+            feat = np.asarray(_sface.feature(aligned), dtype=np.float32)\
+                .reshape(-1)
+        except Exception:  # noqa: BLE001
+            continue
+        sims = [_cosine_sim(feat, t) for t in _user_templates]
+        best = max(sims) if sims else -1.0
+        out["sims"].append((round(best, 3), int(fw)))
+        if best >= thr:
+            out["user_faces"] += 1
+            if best_user is None or best > best_user:
+                best_user = best
+        elif fw >= float(cfg("visitor", "min_face_px", default=80)):
+            out["stranger_faces"] += 1
+    if best_user is not None:
+        out["user_sims"] = round(best_user, 3)
+    return out
+
+
+def _enroll_owner_face(image_bytes, replace=False):
+    """从照片里提取最大人脸特征，注册/追加为主人模板。
+
+    返回 (ok, info)。照片里没检测到脸时报错。
+    """
+    if not _init_opencv() or _yunet is None:
+        return False, "人脸检测模型不可用"
+    if _sface is None:
+        return False, "SFace 模型不可用（检查 vision.recog_enabled 与模型文件）"
+    import cv2
+    import numpy as np
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return False, "照片解码失败"
+    h, w = img.shape[:2]
+    _yunet.setInputSize((w, h))
+    result = _yunet.detect(img)
+    dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+    if dets is None or not len(dets):
+        return False, "照片里没有检测到人脸"
+    # 取最大脸（注册照默认就是主人单人照）
+    d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
+    if float(d[2]) < 60:
+        return False, f"人脸太小（{float(d[2]):.0f}px），请靠近摄像头重拍"
+    aligned = _sface.alignCrop(img, d)
+    feat = np.asarray(_sface.feature(aligned), dtype=np.float32).reshape(-1)
+
+    # 与已有模板的最高相似度（自查一致性：低说明两次注册的可能不是同一人）
+    self_sim = None
+    if _user_templates is not None and not replace:
+        self_sim = round(max(_cosine_sim(feat, t)
+                             for t in _user_templates), 3)
+        feats = np.vstack([_user_templates, feat.reshape(1, -1)])
+    else:
+        feats = feat.reshape(1, -1)
+    np.savez(USER_FACE_FILE, features=feats)
+    _load_user_templates()
+    return True, {"templates": int(feats.shape[0]), "self_sim": self_sim}
 
 
 def detect_presence_opencv(image_bytes):
@@ -479,6 +633,7 @@ def detect_presence_opencv(image_bytes):
     faces_out_roi = 0
     faces_large = 0
     method = "none"
+    dets_in = []
     if _yunet is not None:
         h, w = img.shape[:2]
         _yunet.setInputSize((w, h))
@@ -487,6 +642,7 @@ def detect_presence_opencv(image_bytes):
         if dets is not None and len(dets):
             faces, faces_out_roi, faces_large = _count_faces_in_roi(
                 dets, roi, w, h)
+            dets_in = list(dets)
         method = "yunet"
     elif _cascade is not None:
         rects = _cascade.detectMultiScale(gray, scaleFactor=1.1,
@@ -496,8 +652,18 @@ def detect_presence_opencv(image_bytes):
                 rects, roi, img.shape[1], img.shape[0])
         method = "haar"
 
+    # --- 人脸识别（SFace）：ROI 内的脸是主人还是别人 ---
+    recog = _recognize_owner(img, dets_in, roi, w, h) \
+        if (dets_in and _yunet is not None and roi is not None) \
+        else {"user_sims": None, "user_faces": 0, "stranger_faces": 0,
+              "sims": []}
+    user_faces = recog["user_faces"]
+
     detail = {"method": method, "faces": faces, "motion": motion,
               "faces_large": faces_large,
+              "user_faces": user_faces,
+              "user_sim": recog["user_sims"],
+              "stranger_faces": recog["stranger_faces"],
               "faces_out_roi": faces_out_roi if roi is not None else None,
               "luma_delta": None if luma_delta is None else round(luma_delta, 1),
               "no_motion_streak": _no_motion_streak,
@@ -505,11 +671,17 @@ def detect_presence_opencv(image_bytes):
 
     now = time.time()
 
-    # ① 检测到人脸 —— 最可靠的信号
-    if faces >= 1:
+    # ① 座位区域内认出主人 —— 最可靠的信号（未配 ROI 时退回"有脸即在座"）
+    if user_faces >= 1 or (faces >= 1 and roi is None):
         _no_motion_streak = 0
         _last_in_seat_ts = now
-        return "in_seat", detail
+        return "in_seat", {**detail,
+                           "reason": "owner_face" if user_faces >= 1
+                           else "face"}
+
+    # ② 座位区域里有脸但不是主人 —— 拒绝在座（别人坐在你的座位上）
+    if faces >= 1 and recog["stranger_faces"] >= 1:
+        return "unknown", {**detail, "reason": "face_not_owner"}
 
     # 亮度突变（开关灯、屏幕大面积切换）时帧差不可信；首帧也没有参照
     luma_guard = float(cfg("vision", "luma_change_guard", default=20.0))
@@ -1587,6 +1759,38 @@ def health():
     })
 
 
+@app.route("/enroll", methods=["POST", "GET"])
+def enroll():
+    """主人脸注册：POST 一张单人照（multipart file= 或原始 JPEG），
+    提取最大脸的 SFace 特征入库（data/user_face.npz）。
+
+      POST /enroll                 追加一张模板
+      POST /enroll?replace=1       清空后重新注册
+      GET  /enroll?status=1        查看模板数量
+    注册后立即生效，无需重启。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    if request.args.get("status"):
+        if _cv2_ready is None:
+            _init_opencv()   # 懒加载未触发时模板数为 0，主动初始化一次
+        return jsonify({"ok": True,
+                        "templates": 0 if _user_templates is None
+                        else int(len(_user_templates)),
+                        "file": str(USER_FACE_FILE)})
+    file_obj = request.files.get("file")
+    image_bytes = file_obj.read() if file_obj is not None else request.get_data()
+    if not image_bytes:
+        return jsonify({"ok": False, "error": "没有收到图像数据"}), 400
+    replace = request.args.get("replace") in ("1", "true", "yes")
+    ok, info = _enroll_owner_face(image_bytes, replace=replace)
+    if not ok:
+        return jsonify({"ok": False, "error": str(info)}), 400
+    log(f"主人脸注册成功：模板 {info['templates']} 张"
+        + (f"，与已有模板自相似度 {info['self_sim']}" if info["self_sim"] is not None else ""))
+    return jsonify({"ok": True, **info})
+
+
 @app.route("/vision", methods=["POST"])
 def vision():
     """
@@ -1683,6 +1887,11 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
         STATE["last_presence"] = presence
         STATE["last_vision_faces_large"] = (
             detail.get("faces_large", 0) if isinstance(detail, dict) else 0)
+        # 人脸识别（2026-10-10）：对账/验明正身改认"主人脸"
+        STATE["last_vision_user_faces"] = (
+            detail.get("user_faces", 0) if isinstance(detail, dict) else 0)
+        STATE["last_vision_user_sim"] = (
+            detail.get("user_sim") if isinstance(detail, dict) else None)
         STATE["last_photo_meta"] = {
             "device": device_id,
             "bytes": len(image_bytes),
@@ -1711,19 +1920,31 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                             daemon=True).start()
             STATE["last_in_seat_ts"] = now_iso
 
-            # 访客提醒（P2-⑬）：座位区域内出现第二张"大脸"（贴近工位）→
-            # 飞书 + 机器人说一声。远处邻座的小脸不算（2026-10-09 误报修复）
-            faces = (detail.get("faces_large") if isinstance(detail, dict)
-                     else None)
-            if faces is None:
-                faces = detail.get("faces", 0) if isinstance(detail, dict) else 0
-            min_faces = int(cfg("visitor", "min_faces", default=2))
+            # 访客提醒（P2-⑬，2026-10-10 人脸识别版）：座位区域里出现
+            # "不是主人"的大脸 → 飞书记录。识别未启用时退回旧逻辑
+            # （第二张大脸）。远处邻座的小脸不算。
+            strangers = (detail.get("stranger_faces") if isinstance(detail, dict)
+                         else None)
+            recog_on = (detail.get("user_sim") is not None
+                        or (isinstance(detail, dict)
+                            and detail.get("user_faces", 0) > 0))
+            if recog_on and strangers is not None:
+                faces = strangers
+                min_faces = 1
+            else:
+                faces = (detail.get("faces_large") if isinstance(detail, dict)
+                         else None)
+                if faces is None:
+                    faces = (detail.get("faces", 0)
+                             if isinstance(detail, dict) else 0)
+                min_faces = int(cfg("visitor", "min_faces", default=2))
             if cfg("visitor", "enabled", default=True) and faces >= min_faces:
                 v_last = _parse_ts(STATE.get("visitor_last_ts"))
                 cooldown = float(cfg("visitor", "cooldown_minutes", default=10))
                 if v_last is None or (now - v_last).total_seconds() >= cooldown * 60:
                     STATE["visitor_last_ts"] = now_iso
-                    log(f"访客提醒：画面中出现 {faces} 张脸")
+                    log(f"访客提醒：画面中出现 {faces} 张非主人脸"
+                        if recog_on else f"访客提醒：画面中出现 {faces} 张脸")
                     if cfg("notify", "feishu", default=True):
                         threading.Thread(
                             target=notify_feishu,
@@ -1803,6 +2024,25 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                 STATE["in_seat_since"] = None
                 STATE["last_remind_ts"] = None
         # unknown 不改变计时状态
+
+        # 离座访客提醒（2026-10-10 人脸识别解锁）：主人不在工位时，
+        # 座位区域出现"非主人"的大脸 → 飞书推送（识别开启才有 stranger_faces）
+        if (cfg("visitor", "enabled", default=True)
+                and cfg("visitor", "alert_when_away", default=True)
+                and STATE.get("in_seat_since") is None
+                and isinstance(detail, dict)
+                and int(detail.get("stranger_faces") or 0) >= 1):
+            av_last = _parse_ts(STATE.get("away_visitor_last_ts"))
+            av_cd = float(cfg("visitor", "cooldown_minutes", default=10))
+            if av_last is None or (now - av_last).total_seconds() >= av_cd * 60:
+                STATE["away_visitor_last_ts"] = now.isoformat(timespec="seconds")
+                log("离座访客：主人不在时座位区域出现陌生人")
+                if cfg("notify", "feishu", default=True):
+                    threading.Thread(
+                        target=notify_feishu,
+                        args=(f"👀 离座访客：{now.strftime('%H:%M')} 你不在工位时，"
+                              "座位区域出现了别人（可能是来找你的或路过）。",),
+                        daemon=True).start()
 
         since = _parse_ts(STATE.get("in_seat_since"))
         minutes_in_seat = (now - since).total_seconds() / 60 if since else None
@@ -2178,20 +2418,28 @@ def tts_audio(key):
 
 
 def _vision_recently_sees_user(max_age_s=390):
-    """最近一次视觉判定是否为"在座且拍到用户大脸"，且证据未过时。
+    """最近一次视觉判定是否为"在座且认出主人脸"，且证据未过时。
 
-    拍照节奏约 5 分钟一张，390 秒（6.5 分钟）内算新鲜。faces_large>=1 才算
-    真看到人——纯 motion_without_context 的在座不可靠，不能当否决证据。
+    拍照节奏约 5 分钟一张，390 秒（6.5 分钟）内算新鲜。人脸识别开启时
+    user_faces>=1 才算真看到"主人"——纯 motion 兜底在座不可靠，陌生人脸
+    更不能顶替主人。
     """
     with _state_lock:
         ts = STATE.get("last_vision_ts")
         pres = STATE.get("last_presence")
+        user_faces = STATE.get("last_vision_user_faces")
         large = STATE.get("last_vision_faces_large", 0)
     if not ts or pres != "in_seat":
         return False
     t = _parse_ts(ts)
     if t is None or (datetime.now() - t).total_seconds() > max_age_s:
         return False
+    if user_faces is not None:
+        try:
+            return int(user_faces or 0) >= 1
+        except (TypeError, ValueError):
+            return False
+    # 识别未启用时退回旧判据：大脸才算
     try:
         return int(large or 0) >= 1
     except (TypeError, ValueError):
@@ -2235,8 +2483,14 @@ def _check_pending_return(presence, detail):
         if not pr and not pa:
             return
         now = datetime.now()
+        # 验明正身改认"主人脸"（2026-10-10 人脸识别）：识别开启时
+        # user_faces>=1 才是真主人；未启用退回 faces_large
+        user_faces = detail.get("user_faces") if isinstance(detail, dict) else None
         large = detail.get("faces_large", 0) if isinstance(detail, dict) else 0
-        seen = (presence == "in_seat" and int(large or 0) >= 1)
+        if user_faces is not None:
+            seen = (presence == "in_seat" and int(user_faces or 0) >= 1)
+        else:
+            seen = (presence == "in_seat" and int(large or 0) >= 1)
 
         if pr:
             if seen:
