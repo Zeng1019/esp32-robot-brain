@@ -1464,13 +1464,39 @@ def notify_feishu(text, subject=None):
     return False
 
 
+def _device_offline_s():
+    """设备心跳静默时长（秒）。从未见过设备时返回正无穷。"""
+    ts = _DEVICE_LAST_SEEN.get("ts") or 0
+    if not ts:
+        return float("inf")
+    return time.time() - ts
+
+
 def monitor_loop():
-    """兜底：即使没有新照片进来，也要按时间触发提醒"""
+    """兜底：即使没有新照片进来，也要按时间触发提醒。
+
+    2026-10-10 设备离线守卫：设备心跳 >5 分钟无请求时（死机/断网/关机），
+    久坐计时入账并暂停、不再生成提醒——否则监控线程会凭冻结的旧状态
+    把整夜离线都累计成"在座"（实测刷出 688 分钟垃圾账），恢复后还会
+    立刻误触久坐提醒。设备回来后由下一张判定照片重新起算。
+    """
     while True:
         try:
             time.sleep(60)
             with _state_lock:
                 reset_daily_if_needed(STATE)
+                if _device_offline_s() > 300:
+                    if STATE.get("in_seat_since"):
+                        # 离线期间的时长无法核实，直接丢弃不入账
+                        STATE["in_seat_since"] = None
+                        STATE["last_remind_ts"] = None
+                        STATE["offline_timer_paused"] = True
+                        save_state(STATE)
+                        log("设备心跳超时（>5 分钟无请求）：久坐计时暂停，"
+                            "不再生成提醒（设备回来后由照片重新起算）")
+                    continue
+                if STATE.pop("offline_timer_paused", None):
+                    log("设备心跳恢复：久坐计时重新可用")
                 msg = evaluate_reminder(STATE)
                 if msg:
                     push_reminder(STATE, msg)
