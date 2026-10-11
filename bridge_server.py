@@ -1820,7 +1820,7 @@ def enroll():
 # ----------------------- 语音任务路由（2026-10-11） -----------------------
 # 固件 stt 钩子 + 规则分类器判定"复杂任务"→ 打断小智抢答 → POST /agent_task。
 # 桥接把任务以"[语音任务]"前缀打进 WorkBuddy 桌面应用输入框，由当前会话的
-# Agent 接单执行；Agent 干完后回调 /notify type=speak，小爪播报结果。
+# Agent 接单执行；Agent 干完后回调 /notify type=speak，小栗播报结果。
 # （codebuddy CLI 无头模式因与桌面应用抢 4775 端口不可用，见 _agent_inject。）
 # 电脑关机 = 固件 POST 失败 = 固件按简单任务放行给小智，天然回退。
 
@@ -1843,12 +1843,26 @@ def _agent_inject(text):
     （127.0.0.1:4775，端口运行时计算无法配置），桌面开着必然挂起，故
     改走输入框注入（与 xiaozhi-pc-mcp 的 send_to_workbuddy 同机制）。
     任务由 WorkBuddy 当前会话的 Agent 接单，完成后由 Agent 回调
-    /notify type=speak 让小爪播报结果，闭环成立。
+    /notify type=speak 让小栗播报结果，闭环成立。
     """
     import pyautogui
     import pyperclip
     pyautogui.FAILSAFE = False
+    import ctypes
     import pygetwindow as gw
+
+    # 锁屏/安全桌面检测（2026-10-11 16:57 事故：用户离座后电脑锁屏，
+    # Ctrl+V+回车打进了空气里，任务"已注入"却永远没人接单）。
+    # OpenInputDesktop 打不开 = 输入桌面不可达（锁屏/安全桌面），直接失败。
+    try:
+        user32 = ctypes.windll.user32
+        hdesk = user32.OpenInputDesktop(0, False, 0x0002)  # DESKTOP_SWITCHDESKTOP
+        if not hdesk:
+            return False, "电脑锁屏了，输入送不进去"
+        user32.CloseDesktop(hdesk)
+    except Exception:
+        pass  # 检测本身失败不拦截，靠下面的前台校验兜底
+
     wins = [w for w in gw.getWindowsWithTitle("WorkBuddy") if w.title.strip()]
     if not wins:
         return False, "未找到 WorkBuddy 窗口"
@@ -1872,7 +1886,23 @@ def _agent_inject(text):
             win.activate()
         except Exception:
             pass
-    time.sleep(0.7)
+    time.sleep(1.0)
+    # 前台校验：激活没成功绝不盲打——Ctrl+V+回车会落进当前焦点窗口，
+    # 可能是任何应用（2026-10-11 教训：机械成功 ≠ 真的发进去了）。
+    def _workbuddy_focused():
+        try:
+            aw = gw.getActiveWindow()
+            return aw is not None and "workbuddy" in (aw.title or "").lower()
+        except Exception:
+            return False
+    if not _workbuddy_focused():
+        try:
+            win.activate()
+        except Exception:
+            pass
+        time.sleep(0.8)
+        if not _workbuddy_focused():
+            return False, "WorkBuddy 没抢到前台（可能锁屏/最小化），不敢盲发"
     old = ""
     try:
         old = pyperclip.paste()
@@ -1900,7 +1930,8 @@ def _agent_run(task_id, text):
             log(f"agent_task #{task_id} 已注入 WorkBuddy：{text[:60]}")
         else:
             log(f"agent_task #{task_id} 注入失败：{info}", "WARN")
-            push_speak(STATE, "抱歉，WorkBuddy 没找到，任务派送失败了。",
+            # 立即把失败原因播出去，不让设备干等 480s 超时
+            push_speak(STATE, f"抱歉，任务没派出去：{info}",
                        source="agent_task", count_daily=False)
     except Exception as e:  # noqa: BLE001
         log(f"agent_task #{task_id} 异常：{e}", "ERROR")
