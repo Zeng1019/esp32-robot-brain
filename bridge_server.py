@@ -160,7 +160,7 @@ def cfg(*keys, default=None):
 # --------------------------------------------------------------------------
 
 _log_lock = threading.Lock()
-_IS_TTY = sys.stdout.isatty()
+_IS_TTY = sys.stdout is not None and sys.stdout.isatty()
 
 
 def log(msg, level="INFO"):
@@ -1817,6 +1817,131 @@ def enroll():
     return jsonify({"ok": True, **info})
 
 
+# ----------------------- 语音任务路由（2026-10-11） -----------------------
+# 固件 stt 钩子 + 规则分类器判定"复杂任务"→ 打断小智抢答 → POST /agent_task。
+# 桥接把任务以"[语音任务]"前缀打进 WorkBuddy 桌面应用输入框，由当前会话的
+# Agent 接单执行；Agent 干完后回调 /notify type=speak，小爪播报结果。
+# （codebuddy CLI 无头模式因与桌面应用抢 4775 端口不可用，见 _agent_inject。）
+# 电脑关机 = 固件 POST 失败 = 固件按简单任务放行给小智，天然回退。
+
+AGENT_TASK_STATE = {"running": False, "text": "", "id": 0, "started_at": None}
+_AGENT_LOCK = threading.Lock()
+_AGENT_TASK_TIMEOUT_S = 8 * 60
+
+
+def _agent_clip(text, limit=160):
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "……"
+
+
+def _agent_inject(text):
+    """把语音任务以"[语音任务]"前缀打进 WorkBuddy 桌面应用输入框并发送。
+
+    2026-10-11 实测：codebuddy CLI 无头模式与桌面应用抢本地服务端口
+    （127.0.0.1:4775，端口运行时计算无法配置），桌面开着必然挂起，故
+    改走输入框注入（与 xiaozhi-pc-mcp 的 send_to_workbuddy 同机制）。
+    任务由 WorkBuddy 当前会话的 Agent 接单，完成后由 Agent 回调
+    /notify type=speak 让小爪播报结果，闭环成立。
+    """
+    import pyautogui
+    import pyperclip
+    pyautogui.FAILSAFE = False
+    import pygetwindow as gw
+    wins = [w for w in gw.getWindowsWithTitle("WorkBuddy") if w.title.strip()]
+    if not wins:
+        return False, "未找到 WorkBuddy 窗口"
+    win = wins[0]
+    try:
+        if win.isMinimized:
+            win.restore()
+    except Exception:
+        pass
+    # 前台锁定绕过: 先模拟 Alt 键获得激活许可, 再激活窗口
+    try:
+        pyautogui.keyDown("alt")
+        pyautogui.keyUp("alt")
+    except Exception:
+        pass
+    try:
+        import win32com.client
+        win32com.client.Dispatch("WScript.Shell").AppActivate("WorkBuddy")
+    except Exception:
+        try:
+            win.activate()
+        except Exception:
+            pass
+    time.sleep(0.7)
+    old = ""
+    try:
+        old = pyperclip.paste()
+    except Exception:
+        pass
+    pyperclip.copy("[语音任务] " + text)
+    time.sleep(0.15)
+    pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.4)
+    pyautogui.press("enter")
+    try:
+        time.sleep(0.2)
+        pyperclip.copy(old)  # 恢复原剪贴板
+    except Exception:
+        pass
+    return True, "已发送到 WorkBuddy"
+
+
+def _agent_run(task_id, text):
+    """后台线程：注入任务到 WorkBuddy，注入完成即释放占用（执行在
+    WorkBuddy 会话里异步进行，结果回传由 Agent 回调 /notify）。"""
+    try:
+        ok, info = _agent_inject(text)
+        if ok:
+            log(f"agent_task #{task_id} 已注入 WorkBuddy：{text[:60]}")
+        else:
+            log(f"agent_task #{task_id} 注入失败：{info}", "WARN")
+            push_speak(STATE, "抱歉，WorkBuddy 没找到，任务派送失败了。",
+                       source="agent_task", count_daily=False)
+    except Exception as e:  # noqa: BLE001
+        log(f"agent_task #{task_id} 异常：{e}", "ERROR")
+        push_speak(STATE, "抱歉，WorkBuddy 执行任务时出了点问题。",
+                   source="agent_task", count_daily=False)
+    finally:
+        with _AGENT_LOCK:
+            AGENT_TASK_STATE["running"] = False
+
+
+@app.route("/agent_task", methods=["POST"])
+def agent_task():
+    """语音任务路由落点：固件判定复杂任务后转交 WorkBuddy。
+
+      POST /agent_task   JSON {"text": 任务描述}
+      返回 {"status": "accepted"|"busy"|"rejected", ...}
+    accepted 时桥接立即推一条接单回执到 pending，并把任务注入
+    WorkBuddy 输入框（由 WorkBuddy 会话 Agent 接单，结果经 /notify 回传）。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    data = request.get_json(silent=True) or {}
+    text = _agent_clip(str(data.get("text", "")), 600)
+    if not text:
+        return jsonify({"status": "rejected", "reason": "empty"}), 400
+    with _AGENT_LOCK:
+        if AGENT_TASK_STATE["running"]:
+            log(f"agent_task 拒绝（上一单还在跑）：{text[:50]}")
+            return jsonify({"status": "busy",
+                            "reason": "上一个任务还在执行中"})
+        AGENT_TASK_STATE.update(running=True, text=text,
+                                id=AGENT_TASK_STATE["id"] + 1,
+                                started_at=datetime.now().isoformat(timespec="seconds"))
+        task_id = AGENT_TASK_STATE["id"]
+    push_speak(STATE, "好的，我让 WorkBuddy 来处理这个任务，结果出来我叫你。",
+               source="agent_task", count_daily=False)
+    threading.Thread(target=_agent_run, args=(task_id, text),
+                     daemon=True).start()
+    return jsonify({"status": "accepted", "task_id": task_id})
+
+
 @app.route("/vision", methods=["POST"])
 def vision():
     """
@@ -1934,6 +2059,27 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
             if not STATE.get("in_seat_since"):
                 STATE["in_seat_since"] = now_iso
                 log("检测到有人入座，开始计时")
+                # 视觉兜底回归播报（2026-10-10）：幻影回归被拦截后，设备侧
+                # 哨兵状态已切成"在座"，用户真回来时设备不再发"回归"事件，
+                # 正常的哨兵播报路径就不会触发（当日 13:28 实测漏播）。
+                # 这里由视觉轮询兜底：此前有确认过的真离座（away_since 在），
+                # 现在照片见到主人脸入座 → 补一条回归播报，按 away_since
+                # 补算时长。两个防打架守卫：
+                #   - pending_return 在 → 交给 _check_pending_return 验明
+                #     正身路径播报（它有更准的事件时间，避免双播）；
+                #   - pending_away 在 → 离座还在复核中，见脸属于"误报离座"，
+                #     由复核路径静默恢复计时，不能播"回来了"。
+                away_since = _parse_ts(STATE.get("away_since") or "")
+                if (away_since and not STATE.get("pending_return")
+                        and not STATE.get("pending_away")):
+                    minutes = max(
+                        1, int((now - away_since).total_seconds() / 60))
+                    msg = f"主人回到座位啦，刚才离开了大约 {minutes} 分钟。"
+                    STATE["away_since"] = None
+                    STATE["last_remind_ts"] = None
+                    push_speak(STATE, msg, source="sentinel")
+                    log(f"视觉兜底回归播报：确认离座 {minutes} 分钟后"
+                        f"照片见主人脸入座（{msg}）")
                 # 打卡式记录（P2-⑭）：今天第一次确认在座 → 推飞书
                 # 打卡时间无条件记录（进状态与下班汇总），飞书推送才受开关控制
                 if (cfg("punch_in", "enabled", default=True)
