@@ -1817,16 +1817,23 @@ def enroll():
     return jsonify({"ok": True, **info})
 
 
-# ----------------------- 语音任务路由（2026-10-11） -----------------------
+# ----------------------- 语音任务路由（2026-10-11 v2，MCP 版） -----------------------
 # 固件 stt 钩子 + 规则分类器判定"复杂任务"→ 打断小智抢答 → POST /agent_task。
-# 桥接把任务以"[语音任务]"前缀打进 WorkBuddy 桌面应用输入框，由当前会话的
-# Agent 接单执行；Agent 干完后回调 /notify type=speak，小栗播报结果。
-# （codebuddy CLI 无头模式因与桌面应用抢 4775 端口不可用，见 _agent_inject。）
+# 桥接把任务入队（不再往输入框注入），WorkBuddy 用协议方式取任务：
+#   · MCP 工具：bridge_mcp_server.py（stdio，注册进 ~/.workbuddy/mcp.json），
+#     get_agent_task 长轮询取单 / finish_agent_task 回传结果；
+#   · 会话看门：_agent_watcher.py 后台长轮询 /agent_task/poll，取到单即退出，
+#     WorkBuddy 收到后台任务通知后接单执行，干完 POST /agent_task/finish。
+# 结果统一由桥接 push_speak → 小栗 TTS 播报。
+# （v1 输入框注入废弃：锁屏/焦点不对就打进空气里，2026-10-11 两单全丢。）
 # 电脑关机 = 固件 POST 失败 = 固件按简单任务放行给小智，天然回退。
 
-AGENT_TASK_STATE = {"running": False, "text": "", "id": 0, "started_at": None}
+AGENT_TASK_STATE = {"running": False, "status": "", "text": "", "id": 0,
+                    "queued_at": 0.0, "picked_at": 0.0}
 _AGENT_LOCK = threading.Lock()
-_AGENT_TASK_TIMEOUT_S = 8 * 60
+_AGENT_NEW_TASK = threading.Event()
+_AGENT_PICK_TTL_S = 120         # 派出后 120s 没被 WorkBuddy 取走 = 派送失败
+_AGENT_TASK_TIMEOUT_S = 8 * 60  # 取走后 8 分钟没回结果 = 超时释放
 
 
 def _agent_clip(text, limit=160):
@@ -1836,110 +1843,27 @@ def _agent_clip(text, limit=160):
     return text[:limit] + "……"
 
 
-def _agent_inject(text):
-    """把语音任务以"[语音任务]"前缀打进 WorkBuddy 桌面应用输入框并发送。
-
-    2026-10-11 实测：codebuddy CLI 无头模式与桌面应用抢本地服务端口
-    （127.0.0.1:4775，端口运行时计算无法配置），桌面开着必然挂起，故
-    改走输入框注入（与 xiaozhi-pc-mcp 的 send_to_workbuddy 同机制）。
-    任务由 WorkBuddy 当前会话的 Agent 接单，完成后由 Agent 回调
-    /notify type=speak 让小栗播报结果，闭环成立。
-    """
-    import pyautogui
-    import pyperclip
-    pyautogui.FAILSAFE = False
-    import ctypes
-    import pygetwindow as gw
-
-    # 锁屏/安全桌面检测（2026-10-11 16:57 事故：用户离座后电脑锁屏，
-    # Ctrl+V+回车打进了空气里，任务"已注入"却永远没人接单）。
-    # OpenInputDesktop 打不开 = 输入桌面不可达（锁屏/安全桌面），直接失败。
-    try:
-        user32 = ctypes.windll.user32
-        hdesk = user32.OpenInputDesktop(0, False, 0x0002)  # DESKTOP_SWITCHDESKTOP
-        if not hdesk:
-            return False, "电脑锁屏了，输入送不进去"
-        user32.CloseDesktop(hdesk)
-    except Exception:
-        pass  # 检测本身失败不拦截，靠下面的前台校验兜底
-
-    wins = [w for w in gw.getWindowsWithTitle("WorkBuddy") if w.title.strip()]
-    if not wins:
-        return False, "未找到 WorkBuddy 窗口"
-    win = wins[0]
-    try:
-        if win.isMinimized:
-            win.restore()
-    except Exception:
-        pass
-    # 前台锁定绕过: 先模拟 Alt 键获得激活许可, 再激活窗口
-    try:
-        pyautogui.keyDown("alt")
-        pyautogui.keyUp("alt")
-    except Exception:
-        pass
-    try:
-        import win32com.client
-        win32com.client.Dispatch("WScript.Shell").AppActivate("WorkBuddy")
-    except Exception:
-        try:
-            win.activate()
-        except Exception:
-            pass
-    time.sleep(1.0)
-    # 前台校验：激活没成功绝不盲打——Ctrl+V+回车会落进当前焦点窗口，
-    # 可能是任何应用（2026-10-11 教训：机械成功 ≠ 真的发进去了）。
-    def _workbuddy_focused():
-        try:
-            aw = gw.getActiveWindow()
-            return aw is not None and "workbuddy" in (aw.title or "").lower()
-        except Exception:
-            return False
-    if not _workbuddy_focused():
-        try:
-            win.activate()
-        except Exception:
-            pass
-        time.sleep(0.8)
-        if not _workbuddy_focused():
-            return False, "WorkBuddy 没抢到前台（可能锁屏/最小化），不敢盲发"
-    old = ""
-    try:
-        old = pyperclip.paste()
-    except Exception:
-        pass
-    pyperclip.copy("[语音任务] " + text)
-    time.sleep(0.15)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(0.4)
-    pyautogui.press("enter")
-    try:
-        time.sleep(0.2)
-        pyperclip.copy(old)  # 恢复原剪贴板
-    except Exception:
-        pass
-    return True, "已发送到 WorkBuddy"
+def _agent_maybe_expire():
+    """惰性超时清理。返回 (kind, task_id) 表示刚发生一次超时需要播报。"""
+    with _AGENT_LOCK:
+        st = AGENT_TASK_STATE
+        if not st["running"]:
+            return None
+        now = time.time()
+        if st["status"] == "queued" and now - st["queued_at"] > _AGENT_PICK_TTL_S:
+            st.update(running=False, status="")
+            log(f"agent_task #{st['id']} 派送失败：{int(now - st['queued_at'])}s 无人取单", "WARN")
+            return ("fail_pick", st["id"])
+        if st["status"] == "picked" and now - st["picked_at"] > _AGENT_TASK_TIMEOUT_S:
+            st.update(running=False, status="")
+            log(f"agent_task #{st['id']} 执行超时（{int(now - st['picked_at'])}s）释放", "WARN")
+            return ("fail_timeout", st["id"])
+        return None
 
 
-def _agent_run(task_id, text):
-    """后台线程：注入任务到 WorkBuddy，注入完成即释放占用（执行在
-    WorkBuddy 会话里异步进行，结果回传由 Agent 回调 /notify）。"""
-    try:
-        ok, info = _agent_inject(text)
-        if ok:
-            log(f"agent_task #{task_id} 已注入 WorkBuddy：{text[:60]}")
-        else:
-            log(f"agent_task #{task_id} 注入失败：{info}", "WARN")
-            # 立即把失败原因播出去，不让设备干等 480s 超时
-            push_speak(STATE, f"抱歉，任务没派出去：{info}",
-                       source="agent_task", count_daily=False)
-    except Exception as e:  # noqa: BLE001
-        log(f"agent_task #{task_id} 异常：{e}", "ERROR")
-        push_speak(STATE, "抱歉，WorkBuddy 执行任务时出了点问题。",
-                   source="agent_task", count_daily=False)
-    finally:
-        with _AGENT_LOCK:
-            AGENT_TASK_STATE["running"] = False
+# （v1 的 _agent_inject/_agent_run 已删除：pyautogui 注入在锁屏或焦点
+#  不在 WorkBuddy 时会把任务打进空气，且无法感知失败——2026-10-11 两单
+#  全丢的根因。协议取单方案见文件头注释。）
 
 
 @app.route("/agent_task", methods=["POST"])
@@ -1948,29 +1872,110 @@ def agent_task():
 
       POST /agent_task   JSON {"text": 任务描述}
       返回 {"status": "accepted"|"busy"|"rejected", ...}
-    accepted 时桥接立即推一条接单回执到 pending，并把任务注入
-    WorkBuddy 输入框（由 WorkBuddy 会话 Agent 接单，结果经 /notify 回传）。
+    accepted 时任务入队等待 WorkBuddy 取单（MCP 工具或看门脚本长轮询
+    /agent_task/poll），并立即推接单回执给小栗播报。
     """
     if not check_token():
         return "unauthorized", 401
+    expired = _agent_maybe_expire()
+    if expired:
+        _agent_speak_expire(expired)
     data = request.get_json(silent=True) or {}
     text = _agent_clip(str(data.get("text", "")), 600)
     if not text:
         return jsonify({"status": "rejected", "reason": "empty"}), 400
     with _AGENT_LOCK:
         if AGENT_TASK_STATE["running"]:
-            log(f"agent_task 拒绝（上一单还在跑）：{text[:50]}")
+            log(f"agent_task 拒绝（上一单还没取走/做完）：{text[:50]}")
             return jsonify({"status": "busy",
                             "reason": "上一个任务还在执行中"})
-        AGENT_TASK_STATE.update(running=True, text=text,
+        AGENT_TASK_STATE.update(running=True, status="queued", text=text,
                                 id=AGENT_TASK_STATE["id"] + 1,
-                                started_at=datetime.now().isoformat(timespec="seconds"))
+                                queued_at=time.time(), picked_at=0.0)
         task_id = AGENT_TASK_STATE["id"]
+    log(f"agent_task #{task_id} 入队待取：{text[:60]}")
     push_speak(STATE, "好的，我让 WorkBuddy 来处理这个任务，结果出来我叫你。",
                source="agent_task", count_daily=False)
-    threading.Thread(target=_agent_run, args=(task_id, text),
-                     daemon=True).start()
+    _AGENT_NEW_TASK.set()  # 唤醒正在长轮询的取单方
     return jsonify({"status": "accepted", "task_id": task_id})
+
+
+@app.route("/agent_task/poll", methods=["GET"])
+def agent_task_poll():
+    """WorkBuddy 取单长轮询（MCP server / 看门脚本共用）。
+
+      GET /agent_task/poll?wait=45   最多等 wait 秒（上限 60）
+    返回 {"task": null} 或 {"task": {"id": 3, "text": "..."}}。
+    取走即置 picked，等 finish 回传；queued 超过 PICK_TTL 未取走会
+    在惰性清理里播报失败并释放。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    try:
+        wait_s = max(0, min(int(request.args.get("wait", "45")), 60))
+    except ValueError:
+        wait_s = 45
+    deadline = time.time() + wait_s
+    task = None
+    while True:
+        expired = _agent_maybe_expire()
+        if expired:
+            _agent_speak_expire(expired)
+        with _AGENT_LOCK:
+            st = AGENT_TASK_STATE
+            if st["running"] and st["status"] == "queued":
+                st.update(status="picked", picked_at=time.time())
+                task = {"id": st["id"], "text": st["text"]}
+                log(f"agent_task #{st['id']} 已被 WorkBuddy 取走：{st['text'][:60]}")
+                break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        _AGENT_NEW_TASK.wait(min(remaining, 2.0))
+        _AGENT_NEW_TASK.clear()
+    return jsonify({"task": task})
+
+
+@app.route("/agent_task/finish", methods=["POST"])
+def agent_task_finish():
+    """WorkBuddy 干完活回传结果：summary 会被小栗直接播报。
+
+      POST /agent_task/finish  JSON {"task_id": 3, "summary": "播报文本",
+                                     "success": true}
+    """
+    if not check_token():
+        return "unauthorized", 401
+    expired = _agent_maybe_expire()
+    if expired:
+        _agent_speak_expire(expired)
+    data = request.get_json(silent=True) or {}
+    try:
+        task_id = int(data.get("task_id", 0))
+    except (TypeError, ValueError):
+        task_id = 0
+    summary = _agent_clip(str(data.get("summary", "")).strip(), 200)
+    success = bool(data.get("success", True))
+    with _AGENT_LOCK:
+        st = AGENT_TASK_STATE
+        matched = st["running"] and st["id"] == task_id
+        if matched:
+            st.update(running=False, status="")
+    if not matched:
+        log(f"agent_task finish #{task_id} 无匹配的在办任务", "WARN")
+        return jsonify({"ok": False, "reason": "no matching outstanding task"})
+    if not summary:
+        summary = "任务完成了。" if success else "抱歉，这个任务没做成。"
+    log(f"agent_task #{task_id} 完成（success={success}）：{summary[:60]}")
+    push_speak(STATE, summary, source="agent_task", count_daily=False)
+    return jsonify({"ok": True})
+
+
+def _agent_speak_expire(expired):
+    kind, _tid = expired
+    msg = ("WorkBuddy 这会儿没接单，任务先放下了，你可以再说一次试试。"
+           if kind == "fail_pick" else
+           "WorkBuddy 那边的任务做超时了，这一单先放下。")
+    push_speak(STATE, msg, source="agent_task", count_daily=False)
 
 
 @app.route("/vision", methods=["POST"])

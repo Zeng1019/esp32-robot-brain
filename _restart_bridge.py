@@ -23,9 +23,18 @@ r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
 print("kill rc:", r.returncode)
 time.sleep(2)
 
-subprocess.Popen([PYW, MAIN], cwd=ROOT,
-                 creationflags=DETACHED, close_fds=True)
-print("launched pythonw, waiting for port ...")
+# 用 WMI Win32_Process.Create 拉起：创建的进程挂在 WMI 服务下，
+# 不随本脚本/会话退出被回收（Popen DETACHED 实测会被会话清理杀掉，
+# 2026-10-11 18:03 与 17:2x 两次"桥接莫名死亡"皆因此）。
+cmdline = '"%s" "%s"' % (PYW, MAIN)
+ps_launch = ('$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create '
+             "-Arguments @{ CommandLine = '%s'; CurrentDirectory = '%s' }; "
+             'Write-Output ("rc=" + $r.ReturnValue + " pid=" + $r.ProcessId)'
+             % (cmdline.replace("'", "''"), ROOT))
+r = subprocess.run(["powershell", "-NoProfile", "-Command", ps_launch],
+                   capture_output=True, text=True, timeout=30)
+print("launch:", (r.stdout or r.stderr).strip()[:120])
+print("waiting for port ...")
 ok = False
 for _ in range(30):  # 最多等 30s（cv2 等重依赖导入较慢）
     time.sleep(1)
