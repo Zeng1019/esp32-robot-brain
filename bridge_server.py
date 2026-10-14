@@ -1978,6 +1978,130 @@ def _agent_speak_expire(expired):
     push_speak(STATE, msg, source="agent_task", count_daily=False)
 
 
+# ============================================================
+# 人脸跟踪（2026-10-14 舵机云台 v1）
+# 设备把摄像头装在 SG90 摆臂上，以 3-4fps 上传 X-Photo-Type: track 帧；
+# 本端跑 YuNet 找最大人脸的水平偏移，比例控制折算成目标角度，
+# 随 /vision 响应回传 {"servo": 角度}——一帧一闭环，无需额外控制通道。
+# 开关经 pending 队列下发（/tracking/start|stop → 设备 /pending 领单）。
+# ============================================================
+_track_lock = threading.Lock()
+TRACK = {
+    "enabled": False,
+    "angle": 90,          # 当前目标角度（桥接维护，帧间平滑）
+    "last_face_ts": 0.0,  # 最近一次见到人脸的时刻（丢脸超时回中用）
+    "last_frame_ts": 0.0,
+    "frames": 0,
+    "face_frames": 0,
+    "start_ts": None,
+}
+
+
+def _track_cfg():
+    return {
+        "gain": float(cfg("tracking", "gain", default=14.0)),
+        "max_step": float(cfg("tracking", "max_step", default=10.0)),
+        "deadband": float(cfg("tracking", "deadband", default=0.06)),
+        "min_angle": int(cfg("tracking", "min_angle", default=40)),
+        "max_angle": int(cfg("tracking", "max_angle", default=140)),
+        "return_delay": float(cfg("tracking", "return_delay_s", default=5.0)),
+        "flip": bool(cfg("tracking", "flip", default=False)),
+    }
+
+
+def tracking_compute_angle(image_bytes):
+    """对一帧 track 照片跑 YuNet，返回更新后的目标舵机角度（带锁串行化）。"""
+    import cv2
+    import numpy as np
+
+    tc = _track_cfg()
+    now = time.time()
+    with _track_lock:
+        angle = TRACK["angle"]
+        if _init_opencv() and _yunet is not None:
+            arr = np.frombuffer(image_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                _yunet.setInputSize((w, h))
+                result = _yunet.detect(img)
+                dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+                if dets is not None and len(dets):
+                    # 取最大脸（离得最近的人）
+                    d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
+                    cx = float(d[0]) + float(d[2]) / 2.0
+                    offset = (cx - w / 2.0) / (w / 2.0)  # -1.0 .. 1.0
+                    if tc["flip"]:
+                        offset = -offset
+                    if abs(offset) > tc["deadband"]:
+                        step = max(-tc["max_step"],
+                                   min(tc["max_step"], offset * tc["gain"]))
+                        angle += step
+                    TRACK["last_face_ts"] = now
+                    TRACK["face_frames"] += 1
+                elif TRACK["last_face_ts"] and \
+                        now - TRACK["last_face_ts"] > tc["return_delay"]:
+                    # 丢脸超时：每帧回中 2°，不猛甩
+                    if angle > 90:
+                        angle = max(90.0, angle - 2)
+                    elif angle < 90:
+                        angle = min(90.0, angle + 2)
+        angle = int(max(tc["min_angle"],
+                        min(tc["max_angle"], round(angle))))
+        TRACK["angle"] = angle
+        TRACK["frames"] += 1
+        TRACK["last_frame_ts"] = now
+        return angle
+
+
+def _push_pending_command(ctype, message):
+    """往 pending 队列塞一条设备指令（跟踪开关等非播报类）。"""
+    with _state_lock:
+        if len(STATE.get("pending", [])) >= 20:
+            log("pending 队列已满，指令丢弃", "WARN")
+            return False
+        STATE["pending"].append({
+            "type": ctype,
+            "message": message,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+    return True
+
+
+@app.route("/tracking/start", methods=["POST"])
+def tracking_start():
+    TRACK["enabled"] = True
+    TRACK["angle"] = 90
+    TRACK["last_face_ts"] = 0.0
+    TRACK["frames"] = 0
+    TRACK["face_frames"] = 0
+    TRACK["start_ts"] = datetime.now().isoformat(timespec="seconds")
+    ok = _push_pending_command("tracking", "on")
+    log("人脸跟踪：已开启" + ("，指令已下发" if ok else "（pending 队列满，稍后设备重试领取期间照常工作会延迟）"))
+    return jsonify({"ok": True, "queued": ok})
+
+
+@app.route("/tracking/stop", methods=["POST"])
+def tracking_stop():
+    TRACK["enabled"] = False
+    ok = _push_pending_command("tracking", "off")
+    log("人脸跟踪：已停止")
+    return jsonify({"ok": True, "queued": ok})
+
+
+@app.route("/tracking/status", methods=["GET"])
+def tracking_status():
+    age = (time.time() - TRACK["last_face_ts"]) if TRACK["last_face_ts"] else None
+    return jsonify({
+        "enabled": TRACK["enabled"],
+        "angle": TRACK["angle"],
+        "frames": TRACK["frames"],
+        "face_frames": TRACK["face_frames"],
+        "face_age_s": round(age, 1) if age is not None else None,
+        "start_ts": TRACK["start_ts"],
+    })
+
+
 @app.route("/vision", methods=["POST"])
 def vision():
     """
@@ -2025,6 +2149,13 @@ def vision():
                 kwargs={"photo_ts": now, "photo_name": photo_name},
                 daemon=True).start()
         return "好的，我看看水杯。"
+
+    # ---- 跟踪帧（2026-10-14 舵机云台）：只算角度回传，不落盘、不进在座状态机 ----
+    if photo_type == "track":
+        if not TRACK.get("enabled"):
+            return jsonify({"ok": False, "reason": "tracking_off"}), 200
+        angle = tracking_compute_angle(image_bytes)
+        return jsonify({"ok": True, "servo": angle}), 200
 
     # ---- 扩展拍摄位照（2026-09-17 多拍摄位）：ex1/ex2/ex3，只存档不做判定 ----
     if photo_type.startswith("ex") and photo_type[2:].isdigit():
@@ -3417,4 +3548,20 @@ def main():
 
 
 if __name__ == "__main__":
+    # 崩溃留痕：pythonw 下 stderr 为 None，任何未捕获异常/原生崩溃都无声消失。
+    # faulthandler 把段错误等原生崩溃的调用栈写进 bridge_crash.log，便于追溯。
+    try:
+        import faulthandler
+        _crash = open(os.path.join(DATA_DIR, "bridge_crash.log"),
+                      "a", encoding="utf-8", errors="replace")
+        _crash.write("\n[%s] ---- bridge start (pid=%d) ----\n"
+                     % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()))
+        _crash.flush()
+        if sys.stderr is None:
+            sys.stderr = _crash
+        if sys.stdout is None:
+            sys.stdout = _crash
+        faulthandler.enable(file=_crash)
+    except Exception:
+        pass
     main()
