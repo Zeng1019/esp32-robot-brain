@@ -2399,6 +2399,12 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                         args=(f"👀 离座访客：{now.strftime('%H:%M')} 你不在工位时，"
                               "座位区域出现了别人（可能是来找你的或路过）。",),
                         daemon=True).start()
+                # 2026-10-15 用户：离座时来人才需要提醒（在座自己看得到）。
+                # 飞书可能没开，语音播报是主通知路径。
+                if cfg("visitor", "speak_when_away", default=True):
+                    push_speak(STATE,
+                               "主人，你不在工位的时候，有人来到你的座位附近了。",
+                               source="visitor_away")
 
         since = _parse_ts(STATE.get("in_seat_since"))
         minutes_in_seat = (now - since).total_seconds() / 60 if since else None
