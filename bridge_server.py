@@ -684,19 +684,19 @@ def detect_presence_opencv(image_bytes):
                            "reason": "owner_face" if user_faces >= 1
                            else "face"}
 
-    # ② 座位区域里有脸但不是主人（2026-10-15 用户：离远了/歪头/趴睡时认不出
-    # 我，但"座位上有人"是确定的，健康提醒应该照算在座）。默认开启，可关。
+    # ② 座位区域里有脸但都没认出是谁（2026-10-15 用户两轮反馈定稿）：
+    #    仅当"没有任何大脸被判为陌生人"时才算在座——这种情况下 ROI 里的脸
+    #    要么太小（<60px，识别被跳过，只可能是主人坐远了），要么特征提取
+    #    失败。若有大脸认不出（可能是陌生人占座）则落到 ②b 拒绝在座。
     if (cfg("vision", "in_seat_any_face", default=True)
-            and recog.get("roi_faces", 0) >= 1):
+            and recog.get("roi_faces", 0) >= 1
+            and recog["stranger_faces"] == 0):
         _no_motion_streak = 0
         _last_in_seat_ts = now
-        return "in_seat", {**detail,
-                           "reason": "face_present"
-                           if recog["stranger_faces"] == 0
-                           else "face_not_owner"}
+        return "in_seat", {**detail, "reason": "face_unrecognized"}
 
-    # ②b 旧规则保留（in_seat_any_face=false 时生效）：
-    # 座位区域有脸但不是主人 —— 拒绝在座（别人坐在你的座位上）
+    # ②b 座位区域有大脸但不是主人 —— 拒绝在座（可能是陌生人占座），
+    # 访客提醒逻辑会单独处理 stranger_faces
     if faces >= 1 and recog["stranger_faces"] >= 1:
         return "unknown", {**detail, "reason": "face_not_owner"}
 
