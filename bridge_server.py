@@ -483,7 +483,8 @@ def _recognize_owner(img, dets, roi, frame_w, frame_h):
     框过小（< recog_min_face_px，默认 60px）的特征不可靠，跳过识别
     （远处小脸不算主人也不算陌生人）。
     """
-    out = {"user_sims": None, "user_faces": 0, "stranger_faces": 0, "sims": []}
+    out = {"user_sims": None, "user_faces": 0, "stranger_faces": 0, "sims": [],
+           "roi_faces": 0}
     if _sface is None or _user_templates is None or dets is None:
         return out
     import numpy as np
@@ -505,6 +506,9 @@ def _recognize_owner(img, dets, roi, frame_w, frame_h):
         if roi is not None and not (rx <= cx <= rx + rw
                                     and ry <= cy <= ry + rh):
             continue
+        # ROI 内有脸（不论大小/认不认得出）：给"有人就算在座"规则用。
+        # 人离远了脸只有 40~55px，识别不可靠，但"这里坐着人"是确定的。
+        out["roi_faces"] += 1
         if fw < min_px:
             continue
         try:
@@ -656,7 +660,7 @@ def detect_presence_opencv(image_bytes):
     recog = _recognize_owner(img, dets_in, roi, w, h) \
         if (dets_in and _yunet is not None and roi is not None) \
         else {"user_sims": None, "user_faces": 0, "stranger_faces": 0,
-              "sims": []}
+              "sims": [], "roi_faces": 0}
     user_faces = recog["user_faces"]
 
     detail = {"method": method, "faces": faces, "motion": motion,
@@ -664,6 +668,7 @@ def detect_presence_opencv(image_bytes):
               "user_faces": user_faces,
               "user_sim": recog["user_sims"],
               "stranger_faces": recog["stranger_faces"],
+              "roi_faces": recog.get("roi_faces", 0),
               "faces_out_roi": faces_out_roi if roi is not None else None,
               "luma_delta": None if luma_delta is None else round(luma_delta, 1),
               "no_motion_streak": _no_motion_streak,
@@ -679,7 +684,19 @@ def detect_presence_opencv(image_bytes):
                            "reason": "owner_face" if user_faces >= 1
                            else "face"}
 
-    # ② 座位区域里有脸但不是主人 —— 拒绝在座（别人坐在你的座位上）
+    # ② 座位区域里有脸但不是主人（2026-10-15 用户：离远了/歪头/趴睡时认不出
+    # 我，但"座位上有人"是确定的，健康提醒应该照算在座）。默认开启，可关。
+    if (cfg("vision", "in_seat_any_face", default=True)
+            and recog.get("roi_faces", 0) >= 1):
+        _no_motion_streak = 0
+        _last_in_seat_ts = now
+        return "in_seat", {**detail,
+                           "reason": "face_present"
+                           if recog["stranger_faces"] == 0
+                           else "face_not_owner"}
+
+    # ②b 旧规则保留（in_seat_any_face=false 时生效）：
+    # 座位区域有脸但不是主人 —— 拒绝在座（别人坐在你的座位上）
     if faces >= 1 and recog["stranger_faces"] >= 1:
         return "unknown", {**detail, "reason": "face_not_owner"}
 
