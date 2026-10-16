@@ -2005,7 +2005,8 @@ def _agent_speak_expire(expired):
 _track_lock = threading.Lock()
 TRACK = {
     "enabled": False,
-    "angle": 90,          # 当前目标角度（桥接维护，帧间平滑）
+    "angle": 90,          # 当前目标水平角度（桥接维护，帧间平滑）
+    "tilt": 90,           # 当前目标俯仰角度（2026-10-16 二维云台）
     "last_face_ts": 0.0,  # 最近一次见到人脸的时刻（丢脸超时回中用）
     "last_frame_ts": 0.0,
     "frames": 0,
@@ -2023,11 +2024,17 @@ def _track_cfg():
         "max_angle": int(cfg("tracking", "max_angle", default=140)),
         "return_delay": float(cfg("tracking", "return_delay_s", default=5.0)),
         "flip": bool(cfg("tracking", "flip", default=False)),
+        # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
+        # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
+        "tilt_gain": float(cfg("tracking", "tilt_gain", default=12.0)),
+        "tilt_flip": bool(cfg("tracking", "tilt_flip", default=False)),
+        "tilt_min_angle": int(cfg("tracking", "tilt_min_angle", default=60)),
+        "tilt_max_angle": int(cfg("tracking", "tilt_max_angle", default=120)),
     }
 
 
 def tracking_compute_angle(image_bytes):
-    """对一帧 track 照片跑 YuNet，返回更新后的目标舵机角度（带锁串行化）。"""
+    """对一帧 track 照片跑 YuNet，返回 (水平角度, 俯仰角度)（带锁串行化）。"""
     import cv2
     import numpy as np
 
@@ -2035,6 +2042,7 @@ def tracking_compute_angle(image_bytes):
     now = time.time()
     with _track_lock:
         angle = TRACK["angle"]
+        tilt = TRACK["tilt"]
         if _init_opencv() and _yunet is not None:
             arr = np.frombuffer(image_bytes, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -2047,6 +2055,7 @@ def tracking_compute_angle(image_bytes):
                     # 取最大脸（离得最近的人）
                     d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
                     cx = float(d[0]) + float(d[2]) / 2.0
+                    cy = float(d[1]) + float(d[3]) / 2.0
                     offset = (cx - w / 2.0) / (w / 2.0)  # -1.0 .. 1.0
                     if tc["flip"]:
                         offset = -offset
@@ -2054,21 +2063,36 @@ def tracking_compute_angle(image_bytes):
                         step = max(-tc["max_step"],
                                    min(tc["max_step"], offset * tc["gain"]))
                         angle += step
+                    # 俯仰：脸偏下（cy > h/2）→ offset_y > 0 → 低头
+                    offset_y = (cy - h / 2.0) / (h / 2.0)
+                    if tc["tilt_flip"]:
+                        offset_y = -offset_y
+                    if abs(offset_y) > tc["deadband"]:
+                        step_y = max(-tc["max_step"],
+                                     min(tc["max_step"], offset_y * tc["tilt_gain"]))
+                        tilt += step_y
                     TRACK["last_face_ts"] = now
                     TRACK["face_frames"] += 1
                 elif TRACK["last_face_ts"] and \
                         now - TRACK["last_face_ts"] > tc["return_delay"]:
-                    # 丢脸超时：每帧回中 2°，不猛甩
+                    # 丢脸超时：每帧双轴各回中 2°，不猛甩
                     if angle > 90:
                         angle = max(90.0, angle - 2)
                     elif angle < 90:
                         angle = min(90.0, angle + 2)
+                    if tilt > 90:
+                        tilt = max(90.0, tilt - 2)
+                    elif tilt < 90:
+                        tilt = min(90.0, tilt + 2)
         angle = int(max(tc["min_angle"],
                         min(tc["max_angle"], round(angle))))
+        tilt = int(max(tc["tilt_min_angle"],
+                       min(tc["tilt_max_angle"], round(tilt))))
         TRACK["angle"] = angle
+        TRACK["tilt"] = tilt
         TRACK["frames"] += 1
         TRACK["last_frame_ts"] = now
-        return angle
+        return angle, tilt
 
 
 def _push_pending_command(ctype, message):
@@ -2089,6 +2113,7 @@ def _push_pending_command(ctype, message):
 def tracking_start():
     TRACK["enabled"] = True
     TRACK["angle"] = 90
+    TRACK["tilt"] = 90
     TRACK["last_face_ts"] = 0.0
     TRACK["frames"] = 0
     TRACK["face_frames"] = 0
@@ -2108,8 +2133,8 @@ def tracking_stop():
 
 @app.route("/servo", methods=["POST"])
 def servo_set_angle():
-    """直接设舵机角度（2026-10-16）：/servo?angle=N 或 JSON {"angle": N}。
-    经 pending 队列下发，设备领单后 SetServoAngleDirect。"""
+    """直接设舵机角度（2026-10-16）：/servo?angle=N[&tilt=M] 或 JSON
+    {"angle": N, "tilt": M}。经 pending 队列下发，msg = "h" 或 "h,v"。"""
     angle = request.values.get("angle", type=int)
     if angle is None:
         body = request.get_json(silent=True) or {}
@@ -2117,11 +2142,23 @@ def servo_set_angle():
             angle = int(body.get("angle"))
         except (TypeError, ValueError):
             angle = None
+    tilt = request.values.get("tilt", type=int)
+    if tilt is None:
+        body = request.get_json(silent=True) or {}
+        try:
+            tilt = int(body.get("tilt"))
+        except (TypeError, ValueError):
+            tilt = None
     if angle is None or not 0 <= angle <= 180:
         return jsonify({"ok": False, "error": "angle must be 0-180"}), 400
-    ok = _push_pending_command("servo", str(angle))
-    log(f"舵机：下发角度 {angle}°" + ("" if ok else "（队列满）"))
-    return jsonify({"ok": True, "angle": angle, "queued": ok})
+    if tilt is not None and not 0 <= tilt <= 180:
+        return jsonify({"ok": False, "error": "tilt must be 0-180"}), 400
+    msg = str(angle) if tilt is None else f"{angle},{tilt}"
+    ok = _push_pending_command("servo", msg)
+    log(f"舵机：下发角度 {angle}°" +
+        (f" 俯仰 {tilt}°" if tilt is not None else "") +
+        ("" if ok else "（队列满）"))
+    return jsonify({"ok": True, "angle": angle, "tilt": tilt, "queued": ok})
 
 
 @app.route("/tracking/status", methods=["GET"])
@@ -2189,8 +2226,8 @@ def vision():
     if photo_type == "track":
         if not TRACK.get("enabled"):
             return jsonify({"ok": False, "reason": "tracking_off"}), 200
-        angle = tracking_compute_angle(image_bytes)
-        return jsonify({"ok": True, "servo": angle}), 200
+        angle, tilt = tracking_compute_angle(image_bytes)
+        return jsonify({"ok": True, "servo": angle, "tilt": tilt}), 200
 
     # ---- 扩展拍摄位照（2026-09-17 多拍摄位）：ex1/ex2/ex3，只存档不做判定 ----
     if photo_type.startswith("ex") and photo_type[2:].isdigit():
