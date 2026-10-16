@@ -2115,6 +2115,7 @@ def tracking_start():
     TRACK["angle"] = 90
     TRACK["tilt"] = 90
     TRACK["last_face_ts"] = 0.0
+    TRACK["last_frame_ts"] = 0.0  # 保活基准归零：首帧到达前不触发补发
     TRACK["frames"] = 0
     TRACK["face_frames"] = 0
     TRACK["start_ts"] = datetime.now().isoformat(timespec="seconds")
@@ -2129,6 +2130,31 @@ def tracking_stop():
     ok = _push_pending_command("tracking", "off")
     log("人脸跟踪：已停止")
     return jsonify({"ok": True, "queued": ok})
+
+
+def _tracking_keepalive():
+    """跟踪保活（2026-10-16）：固件侧在桥接长时间不可达（track_fail>8 自动停）、
+    设备重启等情况下会自己停掉跟踪，但 TRACK["enabled"] 仍为 True，回来后
+    没人再喊它开，表现为"人回来了它不跟了"。每 30s 巡检：enabled 且
+    >90s 没收到 track 帧（正常跟踪时无脸也持续传帧，无帧=跟踪停了或掉线），
+    就补发一条 "on"。设备端重复收到 "on" 是 no-op（只 ack），正在跟时无副作用。"""
+    while True:
+        time.sleep(30)
+        try:
+            if not TRACK.get("enabled"):
+                continue
+            last = TRACK.get("last_frame_ts", 0.0)
+            if last and (time.time() - last) < 90:
+                continue
+            with _state_lock:
+                already = any(p.get("type") == "tracking" and p.get("message") == "on"
+                              for p in STATE.get("pending", []))
+            if already:
+                continue  # 等设备来领取，别刷队列
+            if _push_pending_command("tracking", "on"):
+                log("跟踪保活：超过 90s 未收到 track 帧，已补发开启指令", "WARN")
+        except Exception as exc:
+            log("跟踪保活异常: %s" % exc, "WARN")
 
 
 @app.route("/servo", methods=["POST"])
@@ -2226,7 +2252,11 @@ def vision():
     if photo_type == "track":
         if not TRACK.get("enabled"):
             return jsonify({"ok": False, "reason": "tracking_off"}), 200
+        _t0 = time.time()
         angle, tilt = tracking_compute_angle(image_bytes)
+        # 2026-10-16 平滑化调优：打印每帧耗时与图大小，定位瓶颈（稳定后删）
+        log(f"track帧: {len(image_bytes)//1024}KB 桥接处理{(time.time()-_t0)*1000:.0f}ms "
+            f"-> pan={angle} tilt={tilt}")
         return jsonify({"ok": True, "servo": angle, "tilt": tilt}), 200
 
     # ---- 扩展拍摄位照（2026-09-17 多拍摄位）：ex1/ex2/ex3，只存档不做判定 ----
@@ -3622,6 +3652,8 @@ def main():
         log("提示：hermes.feishu_target 为空，飞书推送会被跳过。"
             "用 `hermes send --list` 查看可用目标。", "WARN")
 
+    threading.Thread(target=_tracking_keepalive, daemon=True,
+                     name="track-keepalive").start()
     app.run(host=host, port=port, threaded=True, debug=False)
 
 
