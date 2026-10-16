@@ -2005,6 +2005,7 @@ def _agent_speak_expire(expired):
 _track_lock = threading.Lock()
 TRACK = {
     "enabled": False,
+    "active": False,      # 设备端是否真在跟（2026-10-16 待机机制：丢脸超时→False）
     "angle": 90,          # 当前目标水平角度（桥接维护，帧间平滑）
     "tilt": 90,           # 当前目标俯仰角度（2026-10-16 二维云台）
     "last_face_ts": 0.0,  # 最近一次见到人脸的时刻（丢脸超时回中用）
@@ -2023,6 +2024,9 @@ def _track_cfg():
         "min_angle": int(cfg("tracking", "min_angle", default=40)),
         "max_angle": int(cfg("tracking", "max_angle", default=140)),
         "return_delay": float(cfg("tracking", "return_delay_s", default=5.0)),
+        # 待机（2026-10-16 用户方案）：持续丢脸超过该秒数就停掉跟踪回中，
+        # 由在座判定负责看到主人回来再自动重启
+        "standby_delay": float(cfg("tracking", "standby_delay_s", default=30.0)),
         "flip": bool(cfg("tracking", "flip", default=False)),
         # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
         # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
@@ -2084,6 +2088,15 @@ def tracking_compute_angle(image_bytes):
                         tilt = max(90.0, tilt - 2)
                     elif tilt < 90:
                         tilt = min(90.0, tilt + 2)
+                    # 待机（2026-10-16 用户方案）：丢脸超过 standby_delay，
+                    # 停掉跟踪回中省电，交给在座判定负责唤醒
+                    if TRACK.get("active") and \
+                            now - TRACK["last_face_ts"] > tc["standby_delay"]:
+                        TRACK["active"] = False
+                        _push_pending_command("tracking", "off")
+                        log("人脸跟踪：持续未见人脸 %.0fs，转待机回中"
+                            "（在座判定看到主人回来会自动重启）"
+                            % (now - TRACK["last_face_ts"]), "WARN")
         angle = int(max(tc["min_angle"],
                         min(tc["max_angle"], round(angle))))
         tilt = int(max(tc["tilt_min_angle"],
@@ -2112,6 +2125,7 @@ def _push_pending_command(ctype, message):
 @app.route("/tracking/start", methods=["POST"])
 def tracking_start():
     TRACK["enabled"] = True
+    TRACK["active"] = True
     TRACK["angle"] = 90
     TRACK["tilt"] = 90
     TRACK["last_face_ts"] = 0.0
@@ -2127,21 +2141,37 @@ def tracking_start():
 @app.route("/tracking/stop", methods=["POST"])
 def tracking_stop():
     TRACK["enabled"] = False
+    TRACK["active"] = False
     ok = _push_pending_command("tracking", "off")
     log("人脸跟踪：已停止")
     return jsonify({"ok": True, "queued": ok})
 
 
 def _tracking_keepalive():
-    """跟踪保活（2026-10-16）：固件侧在桥接长时间不可达（track_fail>8 自动停）、
-    设备重启等情况下会自己停掉跟踪，但 TRACK["enabled"] 仍为 True，回来后
-    没人再喊它开，表现为"人回来了它不跟了"。每 30s 巡检：enabled 且
-    >90s 没收到 track 帧（正常跟踪时无脸也持续传帧，无帧=跟踪停了或掉线），
-    就补发一条 "on"。设备端重复收到 "on" 是 no-op（只 ack），正在跟时无副作用。"""
+    """跟踪保活 + 待机探测（2026-10-16）。
+
+    - active（设备在跟）：>90s 无 track 帧（正常时无脸也持续传帧，无帧=
+      跟踪停了或掉线，如 track_fail>8 自动停 / 设备重启）→ 补发 "on"；
+      设备端重复收到 "on" 是 no-op，正在跟时无副作用。
+    - 待机（丢脸超时已停，等在座判定唤醒）：每 2 分钟兜底塞一张拍照单，
+      加速在座判定。哨兵"回归"事件本来就会立即派复核照（秒级），这里
+      只是哨兵没触发时的兜底。
+    """
+    tick = 0
     while True:
         time.sleep(30)
+        tick += 1
         try:
             if not TRACK.get("enabled"):
+                continue
+            if not TRACK.get("active"):
+                if tick % 4 != 0:
+                    continue
+                with _state_lock:
+                    has = any(p.get("type") == "photo"
+                              for p in STATE.get("pending", []))
+                if not has:
+                    _request_verify_photo()
                 continue
             last = TRACK.get("last_frame_ts", 0.0)
             if last and (time.time() - last) < 90:
@@ -2517,6 +2547,17 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     # 水位判定）已删除——2026-09-16 双拍摄位分流后不再需要。
     log(f"vision: presence={presence} detail={detail} "
         f"in_seat_min={None if minutes_in_seat is None else round(minutes_in_seat)}")
+
+    # 跟踪自动重启（2026-10-16 用户方案）：跟踪开着但处于待机（丢脸超时
+    # 已停）时，在座判定看到主人在座 → 自动重启跟踪
+    if TRACK.get("enabled") and not TRACK.get("active") and presence == "in_seat":
+        TRACK["active"] = True
+        TRACK["angle"] = 90
+        TRACK["tilt"] = 90
+        TRACK["last_face_ts"] = 0.0
+        TRACK["last_frame_ts"] = 0.0
+        _push_pending_command("tracking", "on")
+        log("人脸跟踪：在座判定看到主人回来，自动重启跟踪")
 
     # 哨兵"回归"验明正身：暂扣中的回归事件用本张判定照片复核
     _check_pending_return(presence, detail)
