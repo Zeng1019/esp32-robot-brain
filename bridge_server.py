@@ -2027,6 +2027,10 @@ def _track_cfg():
         # 待机（2026-10-16 用户方案）：持续丢脸超过该秒数就停掉跟踪回中，
         # 由在座判定负责看到主人回来再自动重启
         "standby_delay": float(cfg("tracking", "standby_delay_s", default=30.0)),
+        # 归位姿态（2026-10-17 用户定）：丢脸回中/待机的目标角度，
+        # 与固件 CLAW_SERVO_HOME_PAN/TILT 保持一致
+        "home_pan": int(cfg("tracking", "home_pan", default=100)),
+        "home_tilt": int(cfg("tracking", "home_tilt", default=80)),
         "flip": bool(cfg("tracking", "flip", default=False)),
         # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
         # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
@@ -2079,15 +2083,16 @@ def tracking_compute_angle(image_bytes):
                     TRACK["face_frames"] += 1
                 elif TRACK["last_face_ts"] and \
                         now - TRACK["last_face_ts"] > tc["return_delay"]:
-                    # 丢脸超时：每帧双轴各回中 2°，不猛甩
-                    if angle > 90:
-                        angle = max(90.0, angle - 2)
-                    elif angle < 90:
-                        angle = min(90.0, angle + 2)
-                    if tilt > 90:
-                        tilt = max(90.0, tilt - 2)
-                    elif tilt < 90:
-                        tilt = min(90.0, tilt + 2)
+                    # 丢脸超时：每帧双轴各回 2°，滑向归位姿态（默认 pan100/tilt80）
+                    hp, ht = tc["home_pan"], tc["home_tilt"]
+                    if angle > hp:
+                        angle = max(float(hp), angle - 2)
+                    elif angle < hp:
+                        angle = min(float(hp), angle + 2)
+                    if tilt > ht:
+                        tilt = max(float(ht), tilt - 2)
+                    elif tilt < ht:
+                        tilt = min(float(ht), tilt + 2)
                     # 待机（2026-10-16 用户方案）：丢脸超过 standby_delay，
                     # 停掉跟踪回中省电，交给在座判定负责唤醒
                     if TRACK.get("active") and \
@@ -2124,10 +2129,11 @@ def _push_pending_command(ctype, message):
 
 @app.route("/tracking/start", methods=["POST"])
 def tracking_start():
+    tc = _track_cfg()
     TRACK["enabled"] = True
     TRACK["active"] = True
-    TRACK["angle"] = 90
-    TRACK["tilt"] = 90
+    TRACK["angle"] = tc["home_pan"]
+    TRACK["tilt"] = tc["home_tilt"]
     TRACK["last_face_ts"] = 0.0
     TRACK["last_frame_ts"] = 0.0  # 保活基准归零：首帧到达前不触发补发
     TRACK["frames"] = 0
@@ -2551,9 +2557,10 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     # 跟踪自动重启（2026-10-16 用户方案）：跟踪开着但处于待机（丢脸超时
     # 已停）时，在座判定看到主人在座 → 自动重启跟踪
     if TRACK.get("enabled") and not TRACK.get("active") and presence == "in_seat":
+        tc = _track_cfg()
         TRACK["active"] = True
-        TRACK["angle"] = 90
-        TRACK["tilt"] = 90
+        TRACK["angle"] = tc["home_pan"]
+        TRACK["tilt"] = tc["home_tilt"]
         TRACK["last_face_ts"] = 0.0
         TRACK["last_frame_ts"] = 0.0
         _push_pending_command("tracking", "on")
