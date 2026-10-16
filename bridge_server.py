@@ -2106,6 +2106,24 @@ def tracking_stop():
     return jsonify({"ok": True, "queued": ok})
 
 
+@app.route("/servo", methods=["POST"])
+def servo_set_angle():
+    """直接设舵机角度（2026-10-16）：/servo?angle=N 或 JSON {"angle": N}。
+    经 pending 队列下发，设备领单后 SetServoAngleDirect。"""
+    angle = request.values.get("angle", type=int)
+    if angle is None:
+        body = request.get_json(silent=True) or {}
+        try:
+            angle = int(body.get("angle"))
+        except (TypeError, ValueError):
+            angle = None
+    if angle is None or not 0 <= angle <= 180:
+        return jsonify({"ok": False, "error": "angle must be 0-180"}), 400
+    ok = _push_pending_command("servo", str(angle))
+    log(f"舵机：下发角度 {angle}°" + ("" if ok else "（队列满）"))
+    return jsonify({"ok": True, "angle": angle, "queued": ok})
+
+
 @app.route("/tracking/status", methods=["GET"])
 def tracking_status():
     age = (time.time() - TRACK["last_face_ts"]) if TRACK["last_face_ts"] else None
