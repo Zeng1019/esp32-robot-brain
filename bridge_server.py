@@ -2030,7 +2030,7 @@ def _track_cfg():
         # 归位姿态（2026-10-17 用户定）：丢脸回中/待机的目标角度，
         # 与固件 CLAW_SERVO_HOME_PAN/TILT 保持一致
         "home_pan": int(cfg("tracking", "home_pan", default=100)),
-        "home_tilt": int(cfg("tracking", "home_tilt", default=80)),
+        "home_tilt": int(cfg("tracking", "home_tilt", default=110)),
         "flip": bool(cfg("tracking", "flip", default=False)),
         # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
         # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
@@ -2135,10 +2135,13 @@ def tracking_start():
     TRACK["angle"] = tc["home_pan"]
     TRACK["tilt"] = tc["home_tilt"]
     TRACK["last_face_ts"] = 0.0
-    TRACK["last_frame_ts"] = 0.0  # 保活基准归零：首帧到达前不触发补发
+    TRACK["last_frame_ts"] = time.time()  # 保活基准：给首帧 90s 宽限，不立即补发
     TRACK["frames"] = 0
     TRACK["face_frames"] = 0
     TRACK["start_ts"] = datetime.now().isoformat(timespec="seconds")
+    with _state_lock:
+        STATE["tracking_enabled"] = True  # 持久化：桥接重启后自动恢复
+        save_state(STATE)
     ok = _push_pending_command("tracking", "on")
     log("人脸跟踪：已开启" + ("，指令已下发" if ok else "（pending 队列满，稍后设备重试领取期间照常工作会延迟）"))
     return jsonify({"ok": True, "queued": ok})
@@ -2148,6 +2151,9 @@ def tracking_start():
 def tracking_stop():
     TRACK["enabled"] = False
     TRACK["active"] = False
+    with _state_lock:
+        STATE["tracking_enabled"] = False  # 持久化：桥接重启后不再自动恢复
+        save_state(STATE)
     ok = _push_pending_command("tracking", "off")
     log("人脸跟踪：已停止")
     return jsonify({"ok": True, "queued": ok})
@@ -2562,7 +2568,7 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
         TRACK["angle"] = tc["home_pan"]
         TRACK["tilt"] = tc["home_tilt"]
         TRACK["last_face_ts"] = 0.0
-        TRACK["last_frame_ts"] = 0.0
+        TRACK["last_frame_ts"] = time.time()
         _push_pending_command("tracking", "on")
         log("人脸跟踪：在座判定看到主人回来，自动重启跟踪")
 
@@ -3699,6 +3705,23 @@ def main():
     if not cfg("hermes", "feishu_target", default=""):
         log("提示：hermes.feishu_target 为空，飞书推送会被跳过。"
             "用 `hermes send --list` 查看可用目标。", "WARN")
+
+    # 跟踪开关状态恢复（2026-10-17）：此前 enabled 是内存态，桥接/电脑重启
+    # 就丢（今早电脑开机后"在座判定看到人也不重启"即此因）。从 state.json
+    # 恢复并立即补发开启指令（设备已在跟则 no-op）。
+    if STATE.get("tracking_enabled"):
+        tc = _track_cfg()
+        TRACK["enabled"] = True
+        TRACK["active"] = True
+        TRACK["angle"] = tc["home_pan"]
+        TRACK["tilt"] = tc["home_tilt"]
+        TRACK["last_frame_ts"] = time.time()
+        with _state_lock:
+            has = any(p.get("type") == "tracking" and p.get("message") == "on"
+                      for p in STATE.get("pending", []))
+        if not has:
+            _push_pending_command("tracking", "on")
+        log("人脸跟踪：检测到上次为开启状态，已恢复（补发开启指令）")
 
     threading.Thread(target=_tracking_keepalive, daemon=True,
                      name="track-keepalive").start()
