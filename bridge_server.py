@@ -26,6 +26,8 @@ import json
 import os
 import random
 import re
+import socket
+import struct
 import subprocess
 import sys
 import os
@@ -2199,6 +2201,74 @@ def _tracking_keepalive():
             log("跟踪保活异常: %s" % exc, "WARN")
 
 
+# ---- 跟踪视频流通道（2026-10-17）----
+# 此前跟踪帧逐帧 POST /vision，每帧重建 TCP 连接 + HTTP/multipart 开销把
+# 帧率压在 2-3fps。改为设备在一条常连接上连续推帧：
+#   协议：4 字节小端帧长 + JPEG 字节；应答 ASCII "pan,tilt\n"。
+#   跟踪已关时回 "off\n"，设备收到即自停（省 pending 队列一来一回）。
+
+_TRACK_STREAM_MAX = 500_000  # 帧长上限，防异常长度打爆内存
+
+
+def _recv_exact(conn, n):
+    """收满 n 字节；对端断开返回 None。"""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _track_stream_client(conn, addr):
+    conn.settimeout(3.0)
+    try:
+        while True:
+            head = _recv_exact(conn, 4)
+            if head is None:
+                return
+            (length,) = struct.unpack("<I", head)
+            if length == 0 or length > _TRACK_STREAM_MAX:
+                log(f"track流：{addr} 非法帧长度 {length}，断开", "WARN")
+                return
+            jpeg = _recv_exact(conn, length)
+            if jpeg is None:
+                return
+            if not TRACK.get("enabled"):
+                conn.sendall(b"off\n")
+                continue
+            _t0 = time.time()
+            angle, tilt = tracking_compute_angle(jpeg)
+            log(f"track流: {len(jpeg)//1024}KB 桥接处理{(time.time()-_t0)*1000:.0f}ms "
+                f"-> pan={angle} tilt={tilt}")
+            conn.sendall(("%d,%d\n" % (angle, tilt)).encode())
+    except (OSError, socket.timeout) as exc:
+        log(f"track流：{addr} 连接断开（{exc.__class__.__name__}）")
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _track_stream_server():
+    port = int(cfg("tracking", "stream_port", default=8789))
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(2)
+    log(f"跟踪视频流端口：{port}")
+    while True:
+        try:
+            conn, addr = srv.accept()
+        except OSError:
+            time.sleep(1)
+            continue
+        threading.Thread(target=_track_stream_client, args=(conn, addr),
+                         daemon=True, name="track-stream").start()
+
+
 @app.route("/servo", methods=["POST"])
 def servo_set_angle():
     """直接设舵机角度（2026-10-16）：/servo?angle=N[&tilt=M] 或 JSON
@@ -3725,6 +3795,8 @@ def main():
 
     threading.Thread(target=_tracking_keepalive, daemon=True,
                      name="track-keepalive").start()
+    threading.Thread(target=_track_stream_server, daemon=True,
+                     name="track-stream-accept").start()
     app.run(host=host, port=port, threaded=True, debug=False)
 
 
