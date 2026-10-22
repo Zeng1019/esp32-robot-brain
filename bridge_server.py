@@ -1885,6 +1885,29 @@ def _agent_maybe_expire():
 #  全丢的根因。协议取单方案见文件头注释。）
 
 
+# ---- 语音本地指令（2026-10-22）----
+# 设备控制类口令在桥接本地执行、秒级语音确认，不派给 WorkBuddy（那是
+# 秒级等待换分钟级往返，开关跟踪这种事没必要）。固件 IsComplexTask 的
+# 关键词表已同步加入这些口令（esp_claw_board.cc），命中即路由到这里。
+_TRACK_STOP_PATTERNS = (
+    "退出跟随", "退出跟踪", "停止跟随", "停止跟踪",
+    "关闭跟随", "关闭跟踪", "别跟着我", "不要跟着我",
+    "别看我", "头转回去",
+)
+
+
+def _try_local_command(text):
+    """设备控制类语音口令本地执行。命中返回语音回复文本，否则 None。"""
+    for kw in _TRACK_STOP_PATTERNS:
+        if kw in text:
+            was_on = bool(TRACK.get("enabled") or TRACK.get("active"))
+            tracking_stop_impl()  # 停跟 + 复位归位角（用户设定参数）
+            log("语音本地指令命中「%s」：%s" % (kw, text[:60]))
+            return ("好的，不跟啦，我把头转回去休息啦。"
+                    if was_on else "我本来就没有在跟呀。")
+    return None
+
+
 @app.route("/agent_task", methods=["POST"])
 def agent_task():
     """语音任务路由落点：固件判定复杂任务后转交 WorkBuddy。
@@ -1903,6 +1926,12 @@ def agent_task():
     text = _agent_clip(str(data.get("text", "")), 600)
     if not text:
         return jsonify({"status": "rejected", "reason": "empty"}), 400
+    # 语音本地指令（2026-10-22）：设备控制类口令本地秒回，不入任务队列。
+    # 回 accepted 让固件收线小智会话，接单回执照常 ≤10s 播出。
+    local_reply = _try_local_command(text)
+    if local_reply is not None:
+        push_speak(STATE, local_reply, source="voice_local", count_daily=False)
+        return jsonify({"status": "accepted", "handled": "local"})
     with _AGENT_LOCK:
         if AGENT_TASK_STATE["running"]:
             log(f"agent_task 拒绝（上一单还没取走/做完）：{text[:50]}")
@@ -2015,7 +2044,141 @@ TRACK = {
     "frames": 0,
     "face_frames": 0,
     "start_ts": None,
+    # ---- 安全保障（2026-10-21，俯仰舵机烧毁事故配套）----
+    "pin_pan": None,      # 水平轴限位钉死计时 {"since": ts, "dir": "+"/"-"}
+    "pin_tilt": None,     # 俯仰轴限位钉死计时
+    "breaker": None,      # 熔断记录 {"reason","count","lockout","ts"}
+    "trip_count": 0,      # 连续熔断次数（10 分钟窗口内累计，/tracking/start 清零）
+    "last_trip_ts": 0.0,  # 上次熔断时刻（自动重启冷却用）
+    "owner_sim": None,    # 当前跟踪目标的主人识别相似度（follow_owner_only）
+    "target": None,       # 目标锁定：当前跟的脸中心（归一化），防多人在场来回跳
 }
+
+
+def _safety_cfg():
+    """舵机安全保护参数（2026-10-21）"""
+    return {
+        # 目标角连续钉死限位超过该秒数 → 判定疑似堵转，熔断停跟踪
+        "stall_limit_s": float(cfg("tracking", "stall_limit_s", default=10.0)),
+        # 手动 /servo 指令是否夹到软限位内（标定时可临时关）
+        "servo_clamp": bool(cfg("tracking", "servo_clamp", default=True)),
+        # 熔断时是否语音播报告警
+        "safety_speak": bool(cfg("tracking", "safety_speak", default=True)),
+        # 熔断后自动重启冷却（秒）：给瞬态原因消散的时间，防重启即熔断连击
+        "restart_cooldown_s": float(cfg("tracking", "restart_cooldown_s",
+                                        default=60.0)),
+        # 10 分钟内连续熔断达到该次数 → 锁死，不再自动恢复，需手动重启
+        "trip_lockout": int(cfg("tracking", "trip_lockout", default=3)),
+        # 跟踪只跟主人脸（SFace 验身份）
+        "follow_owner_only": bool(cfg("tracking", "follow_owner_only",
+                                      default=True)),
+    }
+
+
+def _pin_update(key, direction):
+    """限位钉死连击计时：direction 为空=本帧未钉死（清零）；
+    返回已连续钉死的秒数（未钉死返回 0）。"""
+    now = time.time()
+    st = TRACK.get(key)
+    if not direction:
+        TRACK[key] = None
+        return 0.0
+    if not st or st.get("dir") != direction:
+        TRACK[key] = {"since": now, "dir": direction}
+        return 0.0
+    return now - st["since"]
+
+
+def _trip_breaker(axis, direction, duration):
+    """舵机堵转熔断（2026-10-21）：停跟踪 + 回安全姿态 + 告警。
+
+    两级设计（2026-10-21 用户定稿）：归位角就是对着座位的视角，回正后
+    要靠在座判定看到主人回来才能自动重启跟踪——所以熔断默认**不**关掉
+    自动恢复：
+    - 软熔断（连续 <3 次）：停跟踪回正，tracking_enabled 保持开 →
+      在座判定看到主人回来自动重启（60s 冷却）。每次堵转被熔断限制在
+      ≤10s 且随即回正卸力，单次无害。
+    - 锁死（10 分钟内连续 3 次熔断 = 硬件性故障特征，如舵盘打滑/卡死）：
+      tracking_enabled 持久化关，不再自动恢复，必须手动 /tracking/start。
+    事故背景（2026-10-18 俯仰舵机烧毁）：舵盘在输出轴打滑产生恒定偏差 →
+    闭环永远追不中 → 目标角被顶死在限位 → 满电流堵转 ~4 分钟 → 烧机。
+    """
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    now = time.time()
+    last = TRACK.get("last_trip_ts") or 0.0
+    count = TRACK.get("trip_count") or 0
+    count = count + 1 if (last and now - last < 600) else 1
+    lockout = count >= sc["trip_lockout"]
+    TRACK["trip_count"] = count
+    TRACK["last_trip_ts"] = now
+    TRACK["active"] = False
+    TRACK["breaker"] = {
+        "reason": "stall_%s" % axis,
+        "count": count,
+        "lockout": lockout,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+    if lockout:
+        TRACK["enabled"] = False
+        with _state_lock:
+            STATE["tracking_enabled"] = False  # 持久化：重启后也不自动恢复
+            save_state(STATE)
+    _push_pending_command("tracking", "off")
+    # 清零钉死计时：连续熔断按"故障回合"计（每回合都要重新钉满 10s），
+    # 否则帧流还在时会按帧连击，1 秒内凑满 3 次误锁死（2026-10-21 实录）
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["target"] = None
+    # 回归安全姿态=归位视角（与待机回中同一组角度）：既让舵机离开限位
+    # 解除堵转受力，又让摄像头对准座位，供在座判定自动重启
+    _push_pending_command("servo", "%d,%d" % (tc["home_pan"], tc["home_tilt"]))
+    detail = ("%s 轴目标角钉死限位（方向 %s）超过 %.0fs，疑似堵转/舵盘打滑/"
+              "结构件卡死。已停跟踪并回正（pan=%d tilt=%d）。"
+              % (axis, direction, duration, tc["home_pan"], tc["home_tilt"]))
+    if lockout:
+        log("舵机安全保护【锁死】：%s10 分钟内第 %d 次熔断，判定为持续性硬件"
+            "故障，不再自动恢复；确认硬件正常后请用 Dashboard 或 "
+            "POST /tracking/start 手动重启。" % (detail, count), "ERROR")
+        speak_msg = ("主人，舵机连续三次保护触发，跟踪已锁死，快来检查一下云台。")
+    else:
+        log("舵机安全保护触发（第 %d/%d 次）：%s%.0f 秒后冷却结束，"
+            "看到主人回座会自动重启跟踪。"
+            % (count, sc["trip_lockout"], detail, sc["restart_cooldown_s"]),
+            "ERROR")
+        speak_msg = "主人，舵机保护触发了，我先回正休息一下，你坐好了我再接着看你。"
+    if sc["safety_speak"]:
+        try:
+            push_speak(STATE, speak_msg, source="safety", count_daily=False)
+        except Exception as exc:
+            log("安全告警播报入队失败: %s" % exc, "WARN")
+    if cfg("notify", "feishu", default=True):
+        threading.Thread(target=notify_feishu,
+                         args=("🚨 小栗舵机安全告警\n" + detail,),
+                         daemon=True).start()
+
+
+def _safety_startup_check():
+    """启动自检（2026-10-21）：软限位必须包住归位姿态，否则跟踪一开环
+    就会把舵机往限位顶。有问题返回 False，调用方应拒绝自动恢复跟踪。"""
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    problems = []
+    if not tc["min_angle"] < tc["home_pan"] < tc["max_angle"]:
+        problems.append("水平: home_pan=%d 不在行程 [%d, %d] 内"
+                        % (tc["home_pan"], tc["min_angle"], tc["max_angle"]))
+    if not tc["tilt_min_angle"] < tc["home_tilt"] < tc["tilt_max_angle"]:
+        problems.append("俯仰: home_tilt=%d 不在行程 [%d, %d] 内"
+                        % (tc["home_tilt"], tc["tilt_min_angle"],
+                           tc["tilt_max_angle"]))
+    for p in problems:
+        log("舵机安全自检不通过：" + p, "ERROR")
+    log("舵机安全保护：堵转熔断 %.0fs / 手动指令限幅 %s / 水平行程 [%d, %d] / "
+        "俯仰行程 [%d, %d]"
+        % (sc["stall_limit_s"], "开" if sc["servo_clamp"] else "关",
+           tc["min_angle"], tc["max_angle"],
+           tc["tilt_min_angle"], tc["tilt_max_angle"]))
+    return not problems
 
 
 def _track_cfg():
@@ -2040,6 +2203,10 @@ def _track_cfg():
         "tilt_flip": bool(cfg("tracking", "tilt_flip", default=False)),
         "tilt_min_angle": int(cfg("tracking", "tilt_min_angle", default=60)),
         "tilt_max_angle": int(cfg("tracking", "tilt_max_angle", default=120)),
+        # 只跟主人脸（2026-10-22）：跟踪目标必须过 SFace 验身份，防主人
+        # 离开后追着隔壁桌同事走。SFace 模型不可用时退回旧逻辑（跟最大脸）
+        "follow_owner_only": bool(cfg("tracking", "follow_owner_only",
+                                      default=True)),
     }
 
 
@@ -2051,6 +2218,17 @@ def tracking_compute_angle(image_bytes):
     tc = _track_cfg()
     now = time.time()
     with _track_lock:
+        # 非 active 期间（待机/熔断回正/已停）闭环短路：任何残留 track 帧
+        # 只回归位角。防钉死角度继续下发、与回正指令打架（2026-10-21 修）。
+        if not TRACK.get("active"):
+            angle = int(max(tc["min_angle"],
+                            min(tc["max_angle"], tc["home_pan"])))
+            tilt = int(max(tc["tilt_min_angle"],
+                           min(tc["tilt_max_angle"], tc["home_tilt"])))
+            TRACK["angle"] = angle
+            TRACK["tilt"] = tilt
+            TRACK["last_frame_ts"] = now
+            return angle, tilt
         angle = TRACK["angle"]
         tilt = TRACK["tilt"]
         if _init_opencv() and _yunet is not None:
@@ -2061,9 +2239,76 @@ def tracking_compute_angle(image_bytes):
                 _yunet.setInputSize((w, h))
                 result = _yunet.detect(img)
                 dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+                d = None
                 if dets is not None and len(dets):
-                    # 取最大脸（离得最近的人）
+                    # 选跟踪目标。默认最大脸（离得最近的人）；
+                    # follow_owner_only（2026-10-22 用户反馈"我不在时它追
+                    # 隔壁桌同事"——原逻辑不验身份，主人一走就跟着别人转）
+                    # 开启时只跟 SFace 认出的主人脸：按脸大小降序最多验
+                    # 3 张控制 CPU 开销，全都认不出 → 视同丢脸，走回正待机
                     d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
+                    if tc["follow_owner_only"] and _sface is not None \
+                            and _user_templates is not None:
+                        thr = float(cfg("vision", "recog_threshold",
+                                        default=0.363))
+                        # 迟滞门槛（2026-10-22 访客在场来回跳的修复）：已锁定
+                        # 的目标过 thr 就继续跟；重新获取目标必须过更高门槛，
+                        # 防陌生人 0.38 量级的误匹配抢走跟踪
+                        acquire_thr = float(cfg(
+                            "tracking", "recog_acquire_threshold",
+                            default=0.45))
+                        min_px = float(cfg("vision", "recog_min_face_px",
+                                           default=60))
+                        ranked = sorted(
+                            dets, key=lambda r: float(r[2]) * float(r[3]),
+                            reverse=True)[:3]
+                        owner_hits = []  # (sim, cand)
+                        for cand in ranked:
+                            if float(cand[2]) < min_px:
+                                continue  # 脸太小特征不可靠，跳过
+                            try:
+                                aligned = _sface.alignCrop(img, cand)
+                                feat = np.asarray(_sface.feature(aligned),
+                                                  dtype=np.float32).reshape(-1)
+                                best = max(_cosine_sim(feat, t)
+                                           for t in _user_templates)
+                            except Exception:  # noqa: BLE001
+                                continue
+                            if best >= thr:
+                                owner_hits.append((best, cand))
+                        d = None
+                        best = None
+                        if owner_hits:
+                            tgt = TRACK.get("target")
+                            if tgt:
+                                # 目标锁定：优先跟上一帧锁定的那张脸
+                                # （中心位置最近者），而不是每帧全局重选
+                                def _dist(c):
+                                    cxn = (float(c[0]) + float(c[2]) / 2.0) / w
+                                    cyn = (float(c[1]) + float(c[3]) / 2.0) / h
+                                    return ((cxn - tgt["cx"]) ** 2
+                                            + (cyn - tgt["cy"]) ** 2) ** 0.5
+                                sim0, cand0 = min(owner_hits,
+                                                  key=lambda t: _dist(t[1]))
+                                if _dist(cand0) <= 0.3:
+                                    d, best = cand0, sim0
+                            if d is None:
+                                # 无锁定/锁定丢失：重新获取，用高门槛挑最像的
+                                strong = [t for t in owner_hits
+                                          if t[0] >= acquire_thr]
+                                if strong:
+                                    best, d = max(strong,
+                                                  key=lambda t: t[0])
+                        if d is not None:
+                            TRACK["owner_sim"] = round(best, 3)
+                            TRACK["target"] = {
+                                "cx": (float(d[0]) + float(d[2]) / 2.0) / w,
+                                "cy": (float(d[1]) + float(d[3]) / 2.0) / h,
+                            }
+                        else:
+                            TRACK["owner_sim"] = None
+                            TRACK["target"] = None
+                if d is not None:
                     cx = float(d[0]) + float(d[2]) / 2.0
                     cy = float(d[1]) + float(d[3]) / 2.0
                     offset = (cx - w / 2.0) / (w / 2.0)  # -1.0 .. 1.0
@@ -2104,6 +2349,22 @@ def tracking_compute_angle(image_bytes):
                         log("人脸跟踪：持续未见人脸 %.0fs，转待机回中"
                             "（在座判定看到主人回来会自动重启）"
                             % (now - TRACK["last_face_ts"]), "WARN")
+        # ---- 安全保障（2026-10-21）：限位钉死检测 ----
+        # 限幅前的目标角越过软限位且持续 stall_limit_s → 疑似堵转（舵盘打滑/
+        # 结构件顶死/舵机失效），熔断停跟踪。正常跟踪脸居中后即退出钉死，
+        # 不会误触发；真被顶住时 10s 内断闭环，远短于烧机所需的分钟级堵转。
+        sc = _safety_cfg()
+        pin_p = ("+" if angle > tc["max_angle"] + 0.3
+                 else "-" if angle < tc["min_angle"] - 0.3 else "")
+        pin_t = ("+" if tilt > tc["tilt_max_angle"] + 0.3
+                 else "-" if tilt < tc["tilt_min_angle"] - 0.3 else "")
+        dur_p = _pin_update("pin_pan", pin_p)
+        dur_t = _pin_update("pin_tilt", pin_t)
+        if dur_p >= sc["stall_limit_s"]:
+            _trip_breaker("pan", pin_p, dur_p)
+        elif dur_t >= sc["stall_limit_s"]:
+            _trip_breaker("tilt", pin_t, dur_t)
+
         angle = int(max(tc["min_angle"],
                         min(tc["max_angle"], round(angle))))
         tilt = int(max(tc["tilt_min_angle"],
@@ -2141,6 +2402,11 @@ def tracking_start():
     TRACK["frames"] = 0
     TRACK["face_frames"] = 0
     TRACK["start_ts"] = datetime.now().isoformat(timespec="seconds")
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["trip_count"] = 0
+    TRACK["last_trip_ts"] = 0.0
+    TRACK["breaker"] = None  # 手动开启视为已确认硬件正常，清除熔断记录
     with _state_lock:
         STATE["tracking_enabled"] = True  # 持久化：桥接重启后自动恢复
         save_state(STATE)
@@ -2149,16 +2415,34 @@ def tracking_start():
     return jsonify({"ok": True, "queued": ok})
 
 
-@app.route("/tracking/stop", methods=["POST"])
-def tracking_stop():
+def tracking_stop_impl():
+    """停跟踪并复位到归位姿态（用户语音口令 / 手动停止共用）。
+
+    2026-10-22 用户要求：退出跟踪后舵机必须回到设定参数（home_pan/
+    home_tilt，即对着座位的视角），不能停在最后跟踪角度。
+    """
+    tc = _track_cfg()
     TRACK["enabled"] = False
     TRACK["active"] = False
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["target"] = None
+    TRACK["angle"] = tc["home_pan"]
+    TRACK["tilt"] = tc["home_tilt"]
     with _state_lock:
         STATE["tracking_enabled"] = False  # 持久化：桥接重启后不再自动恢复
         save_state(STATE)
-    ok = _push_pending_command("tracking", "off")
-    log("人脸跟踪：已停止")
-    return jsonify({"ok": True, "queued": ok})
+    _push_pending_command("tracking", "off")
+    # 复位归位姿态：先 off 停跟（设备收线断流），随后 servo 指令转回归位角
+    _push_pending_command("servo", "%d,%d" % (tc["home_pan"], tc["home_tilt"]))
+
+
+@app.route("/tracking/stop", methods=["POST"])
+def tracking_stop():
+    tracking_stop_impl()
+    log("人脸跟踪：已停止并复位归位（pan=%d tilt=%d）"
+        % (_track_cfg()["home_pan"], _track_cfg()["home_tilt"]))
+    return jsonify({"ok": True, "homed": True})
 
 
 def _tracking_keepalive():
@@ -2235,7 +2519,10 @@ def _track_stream_client(conn, addr):
             jpeg = _recv_exact(conn, length)
             if jpeg is None:
                 return
-            if not TRACK.get("enabled"):
+            if not TRACK.get("enabled") or not TRACK.get("active"):
+                # 关闭/待机/熔断回正期间都回 off：设备收到即自停，
+                # 不再继续推帧（2026-10-21 修：此前只看 enabled，软熔断后
+                # 设备继续跟，钉死计时连击导致 1 秒内误锁死）
                 conn.sendall(b"off\n")
                 continue
             _t0 = time.time()
@@ -2291,24 +2578,64 @@ def servo_set_angle():
         return jsonify({"ok": False, "error": "angle must be 0-180"}), 400
     if tilt is not None and not 0 <= tilt <= 180:
         return jsonify({"ok": False, "error": "tilt must be 0-180"}), 400
+    # ---- 安全限幅（2026-10-21）：手动指令也夹到软限位内，防误操作顶死舵机。
+    # 标定行程时可在 config.yaml 设 tracking.servo_clamp=false 临时放开。----
+    clamped = {}
+    if cfg("tracking", "servo_clamp", default=True):
+        tc = _track_cfg()
+        ca = max(tc["min_angle"], min(tc["max_angle"], angle))
+        if ca != angle:
+            clamped["angle"] = [angle, ca]
+            log(f"舵机安全限幅：水平 {angle}° → {ca}°（软限位 "
+                f"{tc['min_angle']}~{tc['max_angle']}）", "WARN")
+            angle = ca
+        if tilt is not None:
+            ct = max(tc["tilt_min_angle"], min(tc["tilt_max_angle"], tilt))
+            if ct != tilt:
+                clamped["tilt"] = [tilt, ct]
+                log(f"舵机安全限幅：俯仰 {tilt}° → {ct}°（软限位 "
+                    f"{tc['tilt_min_angle']}~{tc['tilt_max_angle']}）", "WARN")
+                tilt = ct
     msg = str(angle) if tilt is None else f"{angle},{tilt}"
     ok = _push_pending_command("servo", msg)
     log(f"舵机：下发角度 {angle}°" +
         (f" 俯仰 {tilt}°" if tilt is not None else "") +
         ("" if ok else "（队列满）"))
-    return jsonify({"ok": True, "angle": angle, "tilt": tilt, "queued": ok})
+    return jsonify({"ok": True, "angle": angle, "tilt": tilt,
+                    "clamped": clamped or None, "queued": ok})
 
 
 @app.route("/tracking/status", methods=["GET"])
 def tracking_status():
     age = (time.time() - TRACK["last_face_ts"]) if TRACK["last_face_ts"] else None
+    sc = _safety_cfg()
+
+    def _pin(key):
+        st = TRACK.get(key)
+        if not st:
+            return None
+        return {"dir": st.get("dir"),
+                "seconds": round(time.time() - st["since"], 1)}
     return jsonify({
         "enabled": TRACK["enabled"],
+        "active": TRACK.get("active"),
         "angle": TRACK["angle"],
+        "tilt": TRACK.get("tilt"),
         "frames": TRACK["frames"],
         "face_frames": TRACK["face_frames"],
         "face_age_s": round(age, 1) if age is not None else None,
         "start_ts": TRACK["start_ts"],
+        # 安全保障状态（2026-10-21）
+        "breaker": TRACK.get("breaker"),
+        "trip_count": TRACK.get("trip_count", 0),
+        "pin_pan": _pin("pin_pan"),
+        "pin_tilt": _pin("pin_tilt"),
+        "stall_limit_s": sc["stall_limit_s"],
+        "servo_clamp": sc["servo_clamp"],
+        "restart_cooldown_s": sc["restart_cooldown_s"],
+        "trip_lockout": sc["trip_lockout"],
+        "owner_sim": TRACK.get("owner_sim"),
+        "follow_owner_only": sc["follow_owner_only"],
     })
 
 
@@ -2631,16 +2958,24 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
         f"in_seat_min={None if minutes_in_seat is None else round(minutes_in_seat)}")
 
     # 跟踪自动重启（2026-10-16 用户方案）：跟踪开着但处于待机（丢脸超时
-    # 已停）时，在座判定看到主人在座 → 自动重启跟踪
+    # 已停）时，在座判定看到主人在座 → 自动重启跟踪。
+    # 2026-10-21 配套熔断器：熔断回正后同样走这里恢复；60s 冷却给瞬态
+    # 原因（人站在视野边缘等）消散的时间，防"重启即熔断"连击。
     if TRACK.get("enabled") and not TRACK.get("active") and presence == "in_seat":
-        tc = _track_cfg()
-        TRACK["active"] = True
-        TRACK["angle"] = tc["home_pan"]
-        TRACK["tilt"] = tc["home_tilt"]
-        TRACK["last_face_ts"] = 0.0
-        TRACK["last_frame_ts"] = time.time()
-        _push_pending_command("tracking", "on")
-        log("人脸跟踪：在座判定看到主人回来，自动重启跟踪")
+        sc = _safety_cfg()
+        since_trip = time.time() - (TRACK.get("last_trip_ts") or 0.0)
+        if TRACK.get("last_trip_ts") and since_trip < sc["restart_cooldown_s"]:
+            log("舵机熔断后冷却中（还剩 %.0fs），暂缓自动重启跟踪"
+                % (sc["restart_cooldown_s"] - since_trip), "WARN")
+        else:
+            tc = _track_cfg()
+            TRACK["active"] = True
+            TRACK["angle"] = tc["home_pan"]
+            TRACK["tilt"] = tc["home_tilt"]
+            TRACK["last_face_ts"] = 0.0
+            TRACK["last_frame_ts"] = time.time()
+            _push_pending_command("tracking", "on")
+            log("人脸跟踪：在座判定看到主人回来，自动重启跟踪")
 
     # 哨兵"回归"验明正身：暂扣中的回归事件用本张判定照片复核
     _check_pending_return(presence, detail)
@@ -2843,6 +3178,30 @@ def task():
 #  AudioService::PlaySound 本地喇叭直接播。同文本+音色做磁盘缓存。
 # ==========================================================================
 
+# ---- TTS 失败留痕告警（2026-10-21）----
+# 教训：2026-10-12 起 edge-tts 403 静默失败 5 天（17 次播报无声）无人知晓。
+# 失败必须计数并告警；30 分钟最多提醒一次防刷屏。
+_tts_fail_stat = {"count": 0, "last_ts": 0.0, "last_alert_ts": 0.0}
+_TTS_FAIL_ALERT_COOLDOWN_S = 1800.0
+
+
+def _tts_fail_alert(err):
+    _tts_fail_stat["count"] += 1
+    _tts_fail_stat["last_ts"] = time.time()
+    now = time.time()
+    if now - _tts_fail_stat["last_alert_ts"] < _TTS_FAIL_ALERT_COOLDOWN_S:
+        return
+    _tts_fail_stat["last_alert_ts"] = now
+    log("TTS 连续失败（累计 %d 次）：%s" % (_tts_fail_stat["count"], err),
+        "ERROR")
+    if cfg("notify", "feishu", default=True):
+        threading.Thread(target=notify_feishu, args=(
+            "🔊 小栗 TTS 告警\n语音合成失败（累计 %d 次），最新错误：%s\n"
+            "播报会退化为提示音，请检查网络或 edge-tts 版本（需 >=7.3.1）。"
+            % (_tts_fail_stat["count"], str(err)[:200]),),
+            daemon=True).start()
+
+
 def _tts_synthesize(text, voice, out_path):
     """edge-tts 合成 mp3 → PyAV 转 ogg opus 24kHz mono。成功返回 True。"""
     import tempfile
@@ -2853,6 +3212,7 @@ def _tts_synthesize(text, voice, out_path):
         import av as pyav
     except ImportError as e:
         log(f"TTS 依赖缺失（pip install edge-tts av）：{e}", "WARN")
+        _tts_fail_alert(e)
         return False
 
     mp3_path = _Path(tempfile.gettempdir()) / f"stackchan_tts_{os.getpid()}.mp3"
@@ -2864,6 +3224,7 @@ def _tts_synthesize(text, voice, out_path):
         asyncio.run(_synth())
         if not mp3_path.exists() or mp3_path.stat().st_size < 512:
             log("TTS 合成结果为空", "WARN")
+            _tts_fail_alert("合成结果为空")
             return False
 
         inp = pyav.open(str(mp3_path))
@@ -2882,6 +3243,7 @@ def _tts_synthesize(text, voice, out_path):
         return True
     except Exception as e:  # noqa: BLE001
         log(f"TTS 合成失败：{e}", "WARN")
+        _tts_fail_alert(e)
         return False
     finally:
         try:
@@ -3779,6 +4141,14 @@ def main():
     # 跟踪开关状态恢复（2026-10-17）：此前 enabled 是内存态，桥接/电脑重启
     # 就丢（今早电脑开机后"在座判定看到人也不重启"即此因）。从 state.json
     # 恢复并立即补发开启指令（设备已在跟则 no-op）。
+    # 2026-10-21：先跑舵机安全自检，限位配置不合法（包不住归位姿态）时拒绝
+    # 自动恢复，防止一开机就把舵机往限位顶。
+    _safety_ok = _safety_startup_check()
+    if STATE.get("tracking_enabled") and not _safety_ok:
+        with _state_lock:
+            STATE["tracking_enabled"] = False
+            save_state(STATE)
+        log("跟踪自动恢复已拦截：请先修正 tracking 限位配置", "ERROR")
     if STATE.get("tracking_enabled"):
         tc = _track_cfg()
         TRACK["enabled"] = True

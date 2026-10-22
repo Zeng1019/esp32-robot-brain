@@ -49,4 +49,4 @@ for _ in range(30):  # 最多等 30s（cv2 等重依赖导入较慢）
         s.close()
     if ok:
         break
-print("port 8787:", "OPEN ✓" if ok else "仍拒绝连接 ✗（看 data/bridge.log）")
+print("port 8787:", "OPEN" if ok else "仍拒绝连接（看 data/bridge.log）")
