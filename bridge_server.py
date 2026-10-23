@@ -297,6 +297,7 @@ MODEL_DIR = DATA_DIR / "models"
 YUNET_FILE = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
 SFACE_FILE = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
 USER_FACE_FILE = DATA_DIR / "user_face.npz"   # 主人特征模板（可多张）
+OWNER_REF_FILE = DATA_DIR / "owner_ref.jpg"   # Dashboard 上传的参考照（仅展示）
 
 
 def _download_yunet():
@@ -2194,8 +2195,12 @@ def _track_cfg():
         "standby_delay": float(cfg("tracking", "standby_delay_s", default=30.0)),
         # 归位姿态（2026-10-17 用户定）：丢脸回中/待机的目标角度，
         # 与固件 CLAW_SERVO_HOME_PAN/TILT 保持一致
-        "home_pan": int(cfg("tracking", "home_pan", default=100)),
-        "home_tilt": int(cfg("tracking", "home_tilt", default=110)),
+        # 2026-10-23 起 Dashboard 可改（state.json 覆盖层优先，config.yaml
+        # 作默认值）——cfg() 是启动缓存，改 yaml 必须重启，覆盖层免重启。
+        "home_pan": int((STATE.get("tracking_home") or {}).get(
+            "pan", cfg("tracking", "home_pan", default=100))),
+        "home_tilt": int((STATE.get("tracking_home") or {}).get(
+            "tilt", cfg("tracking", "home_tilt", default=110))),
         "flip": bool(cfg("tracking", "flip", default=False)),
         # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
         # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
@@ -2388,6 +2393,18 @@ def _push_pending_command(ctype, message):
             "created_at": datetime.now().isoformat(timespec="seconds"),
         })
     return True
+
+
+def _push_servo_preview(pan, tilt):
+    """Dashboard 拖滑杆时的角度预览（2026-10-23）。
+
+    先清掉队列里还没被设备领走的 servo 指令，再压一条最新的——
+    否则拖动几秒会积一串过时角度，设备按序执行时头会来回甩。
+    """
+    with _state_lock:
+        STATE["pending"] = [p for p in STATE.get("pending", [])
+                            if p.get("type") != "servo"]
+    return _push_pending_command("servo", "%d,%d" % (pan, tilt))
 
 
 @app.route("/tracking/start", methods=["POST"])
@@ -2637,6 +2654,105 @@ def tracking_status():
         "owner_sim": TRACK.get("owner_sim"),
         "follow_owner_only": sc["follow_owner_only"],
     })
+
+
+@app.route("/api/dashboard/tracking", methods=["GET"])
+def dashboard_tracking_get():
+    """Dashboard「人脸跟踪」页：状态汇总（2026-10-23）"""
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    with _state_lock:
+        has_override = bool(STATE.get("tracking_home"))
+    return jsonify({
+        "ok": True,
+        "enabled": TRACK["enabled"],
+        "active": TRACK.get("active"),
+        "angle": TRACK["angle"],
+        "tilt": TRACK.get("tilt"),
+        "owner_sim": TRACK.get("owner_sim"),
+        "breaker": TRACK.get("breaker"),
+        "trip_count": TRACK.get("trip_count", 0),
+        "home_pan": tc["home_pan"],
+        "home_tilt": tc["home_tilt"],
+        "home_source": "dashboard" if has_override else "config",
+        "limits": {"pan": [tc["min_angle"], tc["max_angle"]],
+                   "tilt": [tc["tilt_min_angle"], tc["tilt_max_angle"]]},
+        "templates": 0 if _user_templates is None
+        else int(len(_user_templates)),
+        "follow_owner_only": sc["follow_owner_only"],
+    })
+
+
+@app.route("/api/dashboard/tracking", methods=["POST"])
+def dashboard_tracking_save():
+    """保存或预览回位角度（2026-10-23）。
+
+    {"home_pan": 100, "home_tilt": 110, "preview": false}
+    - preview=true：只让头转过去（跟踪没在跟时），不落盘
+    - 否则：写 state.json 覆盖层，立即生效免重启
+    """
+    data = request.get_json(silent=True) or {}
+    tc = _track_cfg()
+    try:
+        pan = int(data.get("home_pan", tc["home_pan"]))
+        tilt = int(data.get("home_tilt", tc["home_tilt"]))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "角度必须是整数"}), 400
+    # 必须严格落在软限位内且离边 ≥2°（启动自检同口径，防一开跟踪就顶死）
+    p_lo, p_hi = tc["min_angle"] + 2, tc["max_angle"] - 2
+    t_lo, t_hi = tc["tilt_min_angle"] + 2, tc["tilt_max_angle"] - 2
+    if not p_lo <= pan <= p_hi:
+        return jsonify({"ok": False,
+                        "error": f"水平回位角需在 {p_lo}~{p_hi} 之间"}), 400
+    if not t_lo <= tilt <= t_hi:
+        return jsonify({"ok": False,
+                        "error": f"俯仰回位角需在 {t_lo}~{t_hi} 之间"}), 400
+    preview = bool(data.get("preview"))
+    if not preview:
+        with _state_lock:
+            STATE["tracking_home"] = {"pan": pan, "tilt": tilt}
+            save_state(STATE)
+        log("回位角度已更新（Dashboard）：pan=%d tilt=%d" % (pan, tilt))
+    moved = False
+    if not TRACK.get("active"):
+        # 跟踪没在跟才预览，跟随时舵机归闭环管，不去打扰
+        moved = _push_servo_preview(pan, tilt)
+    return jsonify({"ok": True, "home_pan": pan, "home_tilt": tilt,
+                    "saved": not preview, "servo_preview": moved})
+
+
+@app.route("/api/dashboard/tracking/enroll", methods=["POST"])
+def dashboard_tracking_enroll():
+    """Dashboard 直接注册主人脸（2026-10-23）：multipart file= 或原始 JPEG。
+    ?replace=1 清空重注册。参考照落盘 data/owner_ref.jpg 供页面回显。"""
+    file_obj = request.files.get("file")
+    image_bytes = file_obj.read() if file_obj is not None else request.get_data()
+    if not image_bytes:
+        return jsonify({"ok": False, "error": "没有收到照片"}), 400
+    replace = (str(request.form.get("replace", "")).lower()
+               in ("1", "true", "yes")) or \
+        (request.args.get("replace") in ("1", "true", "yes"))
+    ok, info = _enroll_owner_face(image_bytes, replace=replace)
+    if not ok:
+        return jsonify({"ok": False, "error": str(info)}), 400
+    try:
+        OWNER_REF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OWNER_REF_FILE.write_bytes(image_bytes)
+    except OSError as exc:
+        log("参考照落盘失败：%s" % exc, "WARN")
+    log("Dashboard 注册主人脸：模板 %d 张%s"
+        % (info["templates"], "（已清空重注册）" if replace else "（追加）"))
+    return jsonify({"ok": True, "templates": info["templates"],
+                    "self_sim": info["self_sim"], "replaced": replace,
+                    "ref_url": "/api/dashboard/tracking/ref.jpg?t=%d"
+                    % int(time.time())})
+
+
+@app.route("/api/dashboard/tracking/ref.jpg", methods=["GET"])
+def dashboard_tracking_ref():
+    if not OWNER_REF_FILE.exists():
+        return "", 404
+    return send_file(str(OWNER_REF_FILE), mimetype="image/jpeg")
 
 
 @app.route("/vision", methods=["POST"])
