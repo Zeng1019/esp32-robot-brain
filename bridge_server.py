@@ -2053,6 +2053,8 @@ TRACK = {
     "last_trip_ts": 0.0,  # 上次熔断时刻（自动重启冷却用）
     "owner_sim": None,    # 当前跟踪目标的主人识别相似度（follow_owner_only）
     "target": None,       # 目标锁定：当前跟的脸中心（归一化），防多人在场来回跳
+    "manual": None,       # Dashboard 拖滑杆的手动角度 {"pan","tilt","ts"}：
+                          # 2.5s 内优先于闭环，让"边拉边动"实时生效
 }
 
 
@@ -2236,6 +2238,22 @@ def tracking_compute_angle(image_bytes):
             return angle, tilt
         angle = TRACK["angle"]
         tilt = TRACK["tilt"]
+        # Dashboard 手动插队（2026-10-23）：拖滑杆时把角度直接塞进流回包，
+        # 设备下一帧（~200ms）就转过去——比走 pending 队列快一个数量级。
+        # 松手 2.5s 后自动失效，交还跟踪闭环。
+        manual = TRACK.get("manual")
+        if manual and (now - manual.get("ts", 0)) < 2.5:
+            angle = int(max(tc["min_angle"],
+                            min(tc["max_angle"], manual["pan"])))
+            tilt = int(max(tc["tilt_min_angle"],
+                           min(tc["tilt_max_angle"], manual["tilt"])))
+            TRACK["angle"] = angle
+            TRACK["tilt"] = tilt
+            TRACK["frames"] += 1
+            TRACK["last_frame_ts"] = now
+            return angle, tilt
+        if manual:
+            TRACK["manual"] = None  # 过期清掉，恢复正常闭环
         if _init_opencv() and _yunet is not None:
             arr = np.frombuffer(image_bytes, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -2725,8 +2743,14 @@ def dashboard_tracking_save():
             save_state(STATE)
         log("回位角度已更新（Dashboard）：pan=%d tilt=%d" % (pan, tilt))
     moved = False
-    if not TRACK.get("active"):
-        # 跟踪没在跟才预览，跟随时舵机归闭环管，不去打扰
+    if preview and TRACK.get("active"):
+        # 跟踪闭环在跑：把角度塞进视频流回包（下一帧 ~200ms 生效），
+        # 比 pending 队列（等设备轮询）快得多，拖动能"跟手"
+        with _track_lock:
+            TRACK["manual"] = {"pan": pan, "tilt": tilt, "ts": time.time()}
+        moved = True
+    elif not TRACK.get("active"):
+        # 没在跟：没有流回包，只能走 pending 指令
         moved = _push_servo_preview(pan, tilt)
     return jsonify({"ok": True, "home_pan": pan, "home_tilt": tilt,
                     "saved": not preview, "servo_preview": moved})
