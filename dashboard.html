@@ -547,7 +547,7 @@
             <div class="field">
               <div>
                 <div class="fl">回位角度 · 水平</div>
-                <div class="fd">丢人 30 秒后回到这个角度（对准座位）；拖动即转头，松手 2.5 秒后继续跟人</div>
+                <div class="fd">丢人 30 秒后回到这个角度（对准座位）；跟踪关闭时拖动可预览转头</div>
               </div>
               <div style="display:flex;gap:10px;align-items:center;flex-shrink:0;width:230px">
                 <input type="range" id="trk-pan" class="range" min="42" max="138" step="1" oninput="trkSlide()">
@@ -1254,13 +1254,18 @@ function trkShowValues(){
 function trkSlide(){
   trkShowValues();
   clearTimeout(trkDragTimer);
-  trkDragTimer = setTimeout(trkPreview, 120);   // 跟手：约 120ms 一次（走流回包，不占队列）
+  trkDragTimer = setTimeout(trkPreview, 300);
 }
 async function trkPreview(){
   try{
-    await fetch("/api/dashboard/tracking", {method:"POST",
+    const d = await (await fetch("/api/dashboard/tracking", {method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(Object.assign(trkValues(), {preview:true}))});
+      body: JSON.stringify(Object.assign(trkValues(), {preview:true}))})).json();
+    const st = $("trk-status");
+    if(d && d.tracking_active){
+      st.textContent = "跟踪中：拖动只改数值，头不会转（跟着你才是它的本职）；关掉跟踪后可预览转头";
+      st.className = "status-line";
+    }
   }catch(e){}
 }
 async function loadTracking(){
@@ -1316,8 +1321,9 @@ async function trkSave(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(trkValues())})).json();
     if(!d.ok) throw new Error(d.error || "保存失败");
-    st.textContent = "✓ 已保存，丢人 30 秒后会回到这个角度"
-      + (d.servo_preview && !d.saved ? "（头已跟过去预览）" : "");
+    st.textContent = d.tracking_active
+      ? "✓ 已保存：丢人 30 秒后会回到这个角度（跟踪中头不预转，跟着你才是本职）"
+      : "✓ 已保存，丢人 30 秒后会回到这个角度" + (d.servo_preview ? "（头已跟过去预览）" : "");
     st.className = "status-line ok";
     loadTracking();
   }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
