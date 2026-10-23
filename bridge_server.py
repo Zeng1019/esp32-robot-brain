@@ -2267,43 +2267,66 @@ def tracking_compute_angle(image_bytes):
                         ranked = sorted(
                             dets, key=lambda r: float(r[2]) * float(r[3]),
                             reverse=True)[:3]
-                        owner_hits = []  # (sim, cand)
-                        for cand in ranked:
-                            if float(cand[2]) < min_px:
-                                continue  # 脸太小特征不可靠，跳过
-                            try:
-                                aligned = _sface.alignCrop(img, cand)
-                                feat = np.asarray(_sface.feature(aligned),
-                                                  dtype=np.float32).reshape(-1)
-                                best = max(_cosine_sim(feat, t)
-                                           for t in _user_templates)
-                            except Exception:  # noqa: BLE001
-                                continue
-                            if best >= thr:
-                                owner_hits.append((best, cand))
+                        # 隔帧识别（2026-10-23）：SFace 每张脸 ~15-20ms，3fps
+                        # 闭环里占掉约 10% 帧预算。改为隔帧验身份，中间帧用
+                        # 目标锁定位置补间（0.12 半径内就近认领），平均省一半。
+                        tick = (TRACK.get("recog_tick") or 0) + 1
+                        TRACK["recog_tick"] = tick
+                        tgt_now = TRACK.get("target")
+                        do_recog = (tick % 2 == 1) or (tgt_now is None)
                         d = None
                         best = None
-                        if owner_hits:
-                            tgt = TRACK.get("target")
-                            if tgt:
-                                # 目标锁定：优先跟上一帧锁定的那张脸
-                                # （中心位置最近者），而不是每帧全局重选
-                                def _dist(c):
-                                    cxn = (float(c[0]) + float(c[2]) / 2.0) / w
-                                    cyn = (float(c[1]) + float(c[3]) / 2.0) / h
-                                    return ((cxn - tgt["cx"]) ** 2
-                                            + (cyn - tgt["cy"]) ** 2) ** 0.5
-                                sim0, cand0 = min(owner_hits,
-                                                  key=lambda t: _dist(t[1]))
-                                if _dist(cand0) <= 0.3:
-                                    d, best = cand0, sim0
-                            if d is None:
-                                # 无锁定/锁定丢失：重新获取，用高门槛挑最像的
-                                strong = [t for t in owner_hits
-                                          if t[0] >= acquire_thr]
-                                if strong:
-                                    best, d = max(strong,
-                                                  key=lambda t: t[0])
+                        if do_recog:
+                            owner_hits = []  # (sim, cand)
+                            for cand in ranked:
+                                if float(cand[2]) < min_px:
+                                    continue  # 脸太小特征不可靠，跳过
+                                try:
+                                    aligned = _sface.alignCrop(img, cand)
+                                    feat = np.asarray(_sface.feature(aligned),
+                                                      dtype=np.float32).reshape(-1)
+                                    best = max(_cosine_sim(feat, t)
+                                               for t in _user_templates)
+                                except Exception:  # noqa: BLE001
+                                    continue
+                                if best >= thr:
+                                    owner_hits.append((best, cand))
+                            best = None
+                            if owner_hits:
+                                tgt = TRACK.get("target")
+                                if tgt:
+                                    # 目标锁定：优先跟上一帧锁定的那张脸
+                                    # （中心位置最近者），而不是每帧全局重选
+                                    def _dist(c):
+                                        cxn = (float(c[0]) + float(c[2]) / 2.0) / w
+                                        cyn = (float(c[1]) + float(c[3]) / 2.0) / h
+                                        return ((cxn - tgt["cx"]) ** 2
+                                                + (cyn - tgt["cy"]) ** 2) ** 0.5
+                                    sim0, cand0 = min(owner_hits,
+                                                      key=lambda t: _dist(t[1]))
+                                    if _dist(cand0) <= 0.3:
+                                        d, best = cand0, sim0
+                                if d is None:
+                                    # 无锁定/锁定丢失：重新获取，用高门槛挑最像的
+                                    strong = [t for t in owner_hits
+                                              if t[0] >= acquire_thr]
+                                    if strong:
+                                        best, d = max(strong,
+                                                      key=lambda t: t[0])
+                        else:
+                            # 补间帧：不跑 SFace，离锁定点 0.12 内最近的脸
+                            # 视为同一目标（下一帧仍会验身份纠错）
+                            best_cand, best_dist = None, 1e9
+                            for cand in ranked:
+                                cxn = (float(cand[0]) + float(cand[2]) / 2.0) / w
+                                cyn = (float(cand[1]) + float(cand[3]) / 2.0) / h
+                                dist = ((cxn - tgt_now["cx"]) ** 2
+                                        + (cyn - tgt_now["cy"]) ** 2) ** 0.5
+                                if dist < best_dist:
+                                    best_cand, best_dist = cand, dist
+                            if best_cand is not None and best_dist <= 0.12:
+                                d = best_cand
+                                best = TRACK.get("owner_sim") or thr
                         if d is not None:
                             TRACK["owner_sim"] = round(best, 3)
                             TRACK["target"] = {
@@ -2525,6 +2548,10 @@ def _recv_exact(conn, n):
 def _track_stream_client(conn, addr):
     conn.settimeout(3.0)
     try:
+        # 关 Nagle（2026-10-23）：每帧应答只有 "pan,tilt\n" 十来个字节，
+        # 默认 Nagle 会等 ACK 再发，小包往返平白多几十毫秒；跟踪闭环里
+        # 每一帧都要付这笔账，是"一卡一卡"的隐性成本之一。
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         while True:
             head = _recv_exact(conn, 4)
             if head is None:
