@@ -566,6 +566,7 @@
             </div>
             <div style="display:flex;gap:8px;padding:10px 0 2px;">
               <button class="btn primary" onclick="trkSave()">保存设定</button>
+              <button class="btn" onclick="trkReset()">恢复默认值</button>
             </div>
             <div class="status-line" id="trk-status"></div>
           </div>
@@ -1295,6 +1296,18 @@ function loadRef(url){
   img.onload = function(){ img.style.display = "block"; trkRefLoaded = true; };
   img.onerror = function(){ img.style.display = "none"; };
   img.src = url || ("/api/dashboard/tracking/ref.jpg?t=" + Date.now());
+}
+async function trkReset(){
+  const st = $("trk-status");
+  try{
+    const d = await (await fetch("/api/dashboard/tracking", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({reset:true})})).json();
+    if(!d.ok) throw new Error(d.error || "恢复失败");
+    st.textContent = "✓ 已恢复 config.yaml 默认：" + d.home_pan + "° / " + d.home_tilt + "°";
+    st.className = "status-line ok";
+    loadTracking();
+  }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
 }
 async function trkSave(){
   const st = $("trk-status");
