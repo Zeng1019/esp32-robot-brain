@@ -2692,6 +2692,17 @@ def dashboard_tracking_save():
     - 否则：写 state.json 覆盖层，立即生效免重启
     """
     data = request.get_json(silent=True) or {}
+    # 一键恢复 config.yaml 默认值（2026-10-23）：清掉 state.json 覆盖层
+    if data.get("reset"):
+        with _state_lock:
+            STATE.pop("tracking_home", None)
+            save_state(STATE)
+        tc = _track_cfg()
+        log("回位角度已恢复 config.yaml 默认：pan=%d tilt=%d"
+            % (tc["home_pan"], tc["home_tilt"]))
+        return jsonify({"ok": True, "reset": True,
+                        "home_pan": tc["home_pan"],
+                        "home_tilt": tc["home_tilt"], "saved": True})
     tc = _track_cfg()
     try:
         pan = int(data.get("home_pan", tc["home_pan"]))
