@@ -2926,6 +2926,18 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     with _state_lock:
         STATE["last_vision_ts"] = now.isoformat(timespec="seconds")
         STATE["last_presence"] = presence
+        # 2026-10-27 修复「离开时长算少」：视觉确认离座（无脸+无动作）就
+        # 记为离座起点，不再等设备哨兵的"离座"事件。此前 16:14 人已走、
+        # 视觉连续判 absent，但哨兵 16:38 才报离座 → 回归只播"约 4 分钟"
+        # （真实 28 分钟）。起点只在本轮首次确立，重复事件不覆盖。
+        if (presence == "absent"
+                and isinstance(detail, dict)
+                and detail.get("reason") == "no_face_no_motion_confirmed"
+                and not STATE.get("in_seat_since")
+                and not STATE.get("away_since")):
+            STATE["away_since"] = now.isoformat(timespec="seconds")
+            log("视觉确认离座，开始记录离座起点"
+                f"（{STATE['away_since']}）")
         STATE["last_vision_faces_large"] = (
             detail.get("faces_large", 0) if isinstance(detail, dict) else 0)
         # 人脸识别（2026-10-10）：对账/验明正身改认"主人脸"
@@ -3727,7 +3739,10 @@ def _reconcile_sentinel_event(message):
             if STATE.get("pending_return"):
                 STATE["pending_return"] = None
                 log("哨兵对账：离座事件到达，暂扣中的'回归'判幻影丢弃")
-            STATE["away_since"] = now_iso
+            # 2026-10-27：重复的离座事件不得覆盖已有离座起点——否则「16:14
+            # 已走、16:38 哨兵又报一次离座」会把时长算成 4 分钟
+            if not STATE.get("away_since"):
+                STATE["away_since"] = now_iso
             STATE["pending_away"] = {"ts": now_iso, "seg": seg}
             save_state(STATE)
         log("哨兵对账：报'离座'且无近期人脸证据 → 暂缓结算，立即拍照复核")
