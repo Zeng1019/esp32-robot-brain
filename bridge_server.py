@@ -494,6 +494,11 @@ def _recognize_owner(img, dets, roi, frame_w, frame_h):
 
     min_px = float(cfg("vision", "recog_min_face_px", default=60))
     thr = float(cfg("vision", "recog_threshold", default=0.363))
+    # 2026-10-27 用户反馈「我走了以后，它把右后方的女生认成我」：0.363 是
+    # OpenCV 官方推荐值，本来就偏松，擦线误报压不住。判定「是主人」改用
+    # 更高的门槛（实测主人 98.8% 仍通过、历史陌生人全被挡）；0.363~0.42
+    # 之间算灰区——既不认作主人也不报访客，避免两头误判。
+    owner_thr = float(cfg("vision", "recog_owner_threshold", default=0.42))
     rx = ry = rw = rh = None
     if roi is not None:
         rx, ry, rw, rh = roi
@@ -523,12 +528,24 @@ def _recognize_owner(img, dets, roi, frame_w, frame_h):
         sims = [_cosine_sim(feat, t) for t in _user_templates]
         best = max(sims) if sims else -1.0
         out["sims"].append((round(best, 3), int(fw)))
-        if best >= thr:
+        if best >= owner_thr:
             out["user_faces"] += 1
             if best_user is None or best > best_user:
                 best_user = best
-        elif fw >= float(cfg("visitor", "min_face_px", default=80)):
+        elif best < thr and fw >= float(cfg("visitor", "min_face_px",
+                                           default=80)):
             out["stranger_faces"] += 1
+        # 灰区（thr <= best < owner_thr）：不认主人也不报访客，留档待定标
+        if thr - 0.08 <= best <= owner_thr + 0.13:
+            try:
+                with open(DATA_DIR / "recog_gray.log", "a",
+                          encoding="utf-8") as gf:
+                    gf.write("%s sim=%.3f w=%d roi=%s\n"
+                             % (datetime.now().isoformat(timespec="seconds"),
+                                best, int(fw),
+                                "y" if roi is not None else "n"))
+            except OSError:
+                pass
     if best_user is not None:
         out["user_sims"] = round(best_user, 3)
     return out
@@ -2311,8 +2328,17 @@ def tracking_compute_angle(image_bytes):
                                     strong = [t for t in owner_hits
                                               if t[0] >= acquire_thr]
                                     if strong:
-                                        best, d = max(strong,
-                                                      key=lambda t: t[0])
+                                        # 2026-10-27：连续 2 帧都过门槛才确认，
+                                        # 单帧擦线误匹配（路过的人）拿不走跟踪
+                                        streak = (TRACK.get("acq_streak")
+                                                  or 0) + 1
+                                        TRACK["acq_streak"] = streak
+                                        if streak >= 2:
+                                            best, d = max(strong,
+                                                          key=lambda t: t[0])
+                                            TRACK["acq_streak"] = 0
+                                    else:
+                                        TRACK["acq_streak"] = 0
                         else:
                             # 补间帧：不跑 SFace，离锁定点 0.12 内最近的脸
                             # 视为同一目标（下一帧仍会验身份纠错）
